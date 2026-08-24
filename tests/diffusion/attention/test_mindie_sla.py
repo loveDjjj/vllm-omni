@@ -26,6 +26,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 class _FakeSLA(nn.Module):
     last_shapes = None
+    calls = []
 
     def __init__(self, head_dim, **_kwargs):
         super().__init__()
@@ -33,6 +34,7 @@ class _FakeSLA(nn.Module):
 
     def forward(self, q, k, v):
         type(self).last_shapes = (tuple(q.shape), tuple(k.shape), tuple(v.shape))
+        type(self).calls.append(type(self).last_shapes)
         return q
 
 
@@ -156,6 +158,7 @@ def test_gqa_repeat_is_idempotent_after_hunyuan_repeat():
 
 def test_hybrid_supports_lq_not_equal_lk(fake_mindiesd, tmp_path):
     _load_adapter.cache_clear()
+    _FakeSLA.calls = []
     impl = _make_impl(_make_adapter(tmp_path))
     query = torch.randn(1, 3, 4, 64)
     key = torch.randn(1, 5, 1, 64)
@@ -183,18 +186,25 @@ def test_module_forward_dispatches_to_npu_implementation(fake_mindiesd, tmp_path
     torch.testing.assert_close(output, query)
 
 
-def test_hybrid_rejects_non_suffix_span(fake_mindiesd, tmp_path):
+def test_hybrid_supports_multiple_image_spans_and_trailing_tokens(fake_mindiesd, tmp_path):
     _load_adapter.cache_clear()
+    _FakeSLA.calls = []
     impl = _make_impl(_make_adapter(tmp_path))
-    query = torch.randn(1, 3, 4, 64)
-    key = torch.randn(1, 5, 1, 64)
+    query = torch.randn(1, 12, 4, 64)
+    key = torch.randn(1, 12, 1, 64)
     value = torch.randn_like(key)
     metadata = AttentionMetadata(
-        attn_mask=torch.ones(1, 1, 3, 5, dtype=torch.bool),
-        full_attn_spans=[[(2, 4)]],
+        attn_mask=torch.ones(1, 1, 12, 12, dtype=torch.bool).tril(),
+        full_attn_spans=[[(1, 4), (6, 9)]],
     )
-    with pytest.raises(ValueError, match="image suffix ending at the KV length"):
-        impl._hybrid_masked_forward(query, key, value, metadata)
+
+    output = impl._hybrid_masked_forward(query, key, value, metadata)
+
+    assert output.shape == query.shape
+    assert _FakeSLA.calls == [
+        ((1, 4, 3, 64), (1, 4, 4, 64), (1, 4, 4, 64)),
+        ((1, 4, 3, 64), (1, 4, 9, 64), (1, 4, 9, 64)),
+    ]
 
 
 def test_joint_sequence_parallel_is_rejected():

@@ -23,6 +23,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
+from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import build_segments
 
 logger = init_logger(__name__)
 
@@ -298,7 +299,8 @@ class MindIESLAImpl(nn.Module, AttentionImpl):
         if spans_by_batch is None or len(spans_by_batch) != query.shape[0]:
             raise ValueError("MINDIE_SLA hybrid mask policy requires full_attn_spans for every batch row.")
 
-        query_offset = key.shape[1] - query.shape[1]
+        query_len = query.shape[1]
+        query_offset = key.shape[1] - query_len
         if query_offset < 0:
             raise ValueError(
                 "MINDIE_SLA hybrid mode requires KV length >= query length; "
@@ -306,36 +308,49 @@ class MindIESLAImpl(nn.Module, AttentionImpl):
             )
         rows = []
         for batch_index, spans in enumerate(spans_by_batch):
-            intersections = [
-                (max(start, query_offset), min(end, key.shape[1]))
-                for start, end in spans
-                if max(start, query_offset) < min(end, key.shape[1])
-            ]
-            if len(intersections) != 1 or intersections[0][1] != key.shape[1]:
-                raise ValueError(
-                    "MINDIE_SLA hybrid mode requires one full-attention image suffix ending at the KV length; "
-                    f"batch={batch_index}, spans={spans}, q_offset={query_offset}, kv_len={key.shape[1]}."
+            segments = build_segments(spans, query_offset, query_len)
+            row_outputs = []
+            for segment in segments:
+                local_start = segment.q_start - query_offset
+                local_end = segment.q_end - query_offset
+                row_query = query[batch_index : batch_index + 1, local_start:local_end]
+                if segment.mode == "full":
+                    if segment.kv_end > key.shape[1]:
+                        raise ValueError(
+                            "MINDIE_SLA full-attention span exceeds the KV length: "
+                            f"batch={batch_index}, span={segment}, kv_len={key.shape[1]}."
+                        )
+                    row_output = self._run_sla(
+                        row_query,
+                        key[batch_index : batch_index + 1, : segment.kv_end],
+                        value[batch_index : batch_index + 1, : segment.kv_end],
+                    )
+                else:
+                    row_metadata = AttentionMetadata(
+                        attn_mask=attn_metadata.attn_mask[
+                            batch_index : batch_index + 1,
+                            :,
+                            local_start:local_end,
+                            :,
+                        ]
+                    )
+                    row_output = self.dense_fallback._forward_impl(
+                        row_query,
+                        key[batch_index : batch_index + 1],
+                        value[batch_index : batch_index + 1],
+                        row_metadata,
+                        mask_mode="full_qk",
+                    )
+                row_outputs.append(row_output)
+            if not row_outputs:
+                raise ValueError(f"MINDIE_SLA hybrid mode produced no segments for batch={batch_index}, spans={spans}.")
+            row = torch.cat(row_outputs, dim=1)
+            if row.shape[1] != query_len:
+                raise RuntimeError(
+                    "MINDIE_SLA hybrid segmentation did not cover the query: "
+                    f"batch={batch_index}, expected={query_len}, actual={row.shape[1]}, spans={spans}."
                 )
-            local_start = intersections[0][0] - query_offset
-            if local_start:
-                row_metadata = AttentionMetadata(
-                    attn_mask=attn_metadata.attn_mask[batch_index : batch_index + 1, :, :local_start, :]
-                )
-                dense_prefix = self.dense_fallback._forward_impl(
-                    query[batch_index : batch_index + 1, :local_start],
-                    key[batch_index : batch_index + 1],
-                    value[batch_index : batch_index + 1],
-                    row_metadata,
-                    mask_mode="full_qk",
-                )
-            else:
-                dense_prefix = query[batch_index : batch_index + 1, :0]
-            sparse_suffix = self._run_sla(
-                query[batch_index : batch_index + 1, local_start:],
-                key[batch_index : batch_index + 1],
-                value[batch_index : batch_index + 1],
-            )
-            rows.append(torch.cat([dense_prefix, sparse_suffix], dim=1))
+            rows.append(row)
         return torch.cat(rows, dim=0)
 
     def forward_npu(
