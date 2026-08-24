@@ -349,3 +349,14 @@ class MindIESLAImpl(nn.Module, AttentionImpl):
         if attn_metadata is not None and attn_metadata.attn_mask is not None:
             return self._hybrid_masked_forward(query, key, value, attn_metadata)
         return self._run_sla(query, key, value)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None = None,
+    ) -> torch.Tensor:
+        # nn.Module precedes AttentionImpl in the MRO, so its placeholder
+        # forward would otherwise hide AttentionImpl's platform dispatcher.
+        return self.forward_npu(query, key, value, attn_metadata)

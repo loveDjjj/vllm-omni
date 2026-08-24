@@ -170,6 +170,19 @@ def test_hybrid_supports_lq_not_equal_lk(fake_mindiesd, tmp_path):
     assert _FakeSLA.last_shapes == ((1, 4, 2, 64), (1, 4, 5, 64), (1, 4, 5, 64))
 
 
+def test_module_forward_dispatches_to_npu_implementation(fake_mindiesd, tmp_path):
+    _load_adapter.cache_clear()
+    impl = _make_impl(_make_adapter(tmp_path))
+    query = torch.randn(1, 3, 4, 64)
+    key = torch.randn(1, 3, 1, 64)
+    value = torch.randn_like(key)
+
+    output = impl(query, key, value)
+
+    assert output.shape == query.shape
+    torch.testing.assert_close(output, query)
+
+
 def test_hybrid_rejects_non_suffix_span(fake_mindiesd, tmp_path):
     _load_adapter.cache_clear()
     impl = _make_impl(_make_adapter(tmp_path))
