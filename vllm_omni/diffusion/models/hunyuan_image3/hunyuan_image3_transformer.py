@@ -913,7 +913,7 @@ class HunYuanRotary2DEmbedder:
         return q, k
 
 
-class ImageKVCacheManager:
+class ImageKVCacheManager(nn.Module):
     """
     Manages specialized caching and updating of KV-Cache for image tokens in multimodal models.
     """
@@ -932,6 +932,7 @@ class ImageKVCacheManager:
             image_token_len: Number of tokens per image (including special placeholders),
             default 4097 (timestamp + 4096 image tokens).
         """
+        super().__init__()
         # attention related
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -953,6 +954,7 @@ class ImageKVCacheManager:
             softmax_scale=self.scaling,
             num_kv_heads=self.num_kv_heads,
             prefix=f"{prefix}.attn" if prefix else "",
+            role="hunyuan.diffusion",
         )
 
     @staticmethod
@@ -1095,7 +1097,7 @@ class ImageKVCacheManager:
         )
         return key, value
 
-    def __call__(
+    def forward(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
@@ -1361,6 +1363,7 @@ class HunyuanImage3Config(PretrainedConfig):
         vit=None,
         vit_processor=None,
         vit_aligner=None,
+        cfg_distilled=False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -1439,6 +1442,7 @@ class HunyuanImage3Config(PretrainedConfig):
         self.patch_size = patch_size
         self.patch_embed_hidden_dim = patch_embed_hidden_dim
         self.image_base_size = image_base_size
+        self.cfg_distilled = cfg_distilled
 
         # token id
         self.eod_token_id = eod_token_id
@@ -1474,7 +1478,7 @@ class HunyuanImage3ImageProcessor:
         )
         self.vision_encoder_processor = Siglip2ImageProcessorFast.from_dict(config.vit_processor)
 
-    def build_image_info(self, image_size):
+    def build_image_info(self, image_size, *, add_guidance_token: bool = False):
         # parse image size (HxW, H:W, or <img_ratio_i>)
         if isinstance(image_size, str):
             if image_size.startswith("<img_ratio_"):
@@ -1511,6 +1515,7 @@ class HunyuanImage3ImageProcessor:
             token_height=token_height,
             base_size=base_size,
             ratio_index=ratio_idx,
+            add_guidance_token=add_guidance_token,
         )
         return image_info
 
@@ -1736,6 +1741,7 @@ class HunYuanAttention(nn.Module):
             # cache_config=cache_config,
             # quant_config=quant_config,
             prefix=f"{prefix}.attn",
+            role="hunyuan.ar",
         )
 
         # default image_token_len = timestamp + 4096*image_tokes
@@ -2894,6 +2900,8 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         # Shift image_mask and gen_timestep_scatter_index to match truncated sequence
         model_kwargs["image_mask"] = model_kwargs["image_mask"][:, positive_reuse_len:]
         model_kwargs["gen_timestep_scatter_index"] = model_kwargs["gen_timestep_scatter_index"] - positive_reuse_len
+        if model_kwargs.get("guidance_scatter_index") is not None:
+            model_kwargs["guidance_scatter_index"] = model_kwargs["guidance_scatter_index"] - positive_reuse_len
         model_kwargs["ar_kv_reuse_offset"] = positive_reuse_len
 
         # cond-image have computed in ar, we may skip it by index in the future.
@@ -2936,7 +2944,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         self.model.inject_ar_kv_into_layers(ar_kv_data, positive_reuse_len)
 
         # 3. negative cfg prefill
-        if self.do_classifier_free_guidance:
+        if self.do_classifier_free_guidance and not self.model.cfg_distilled:
             self._maybe_run_negative_cfg_prefill(
                 input_ids=input_ids,
                 model_kwargs=model_kwargs,
@@ -3042,9 +3050,11 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
 
         self._guidance_scale = guidance_scale
         self._guidance_rescale = guidance_rescale
+        cfg_distilled = self.model.cfg_distilled
+        do_true_cfg = self.do_classifier_free_guidance and not cfg_distilled
 
         # Detect CFG parallel configuration (only 2-branch layout is supported)
-        cfg_parallel_ready = self.do_classifier_free_guidance and get_classifier_free_guidance_world_size() == 2
+        cfg_parallel_ready = do_true_cfg and get_classifier_free_guidance_world_size() == 2
 
         # Define call parameters
         device = self._execution_device
@@ -3097,7 +3107,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             attention_mask = attention_mask[s]
             self._split_model_kwargs_for_cfg_parallel(model_kwargs, batch_size, cfg_rank)
         else:
-            cfg_factor = 1 + self.do_classifier_free_guidance
+            cfg_factor = 1 + do_true_cfg
             cfg_rank = None
 
         b, _, q_len1, seq_len = attention_mask.shape
@@ -3140,6 +3150,13 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     latent_model_input = torch.cat([latents] * cfg_factor)
 
                 t_expand = t.repeat(latent_model_input.shape[0])
+                if cfg_distilled:
+                    model_kwargs["guidance"] = torch.full(
+                        (latent_model_input.shape[0],),
+                        1000.0 * self._guidance_scale,
+                        device=device,
+                        dtype=torch.bfloat16,
+                    )
 
                 # ---- TeaCache: decide whether to compute or reuse ----
                 should_compute = True
@@ -3183,7 +3200,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     # CFG parallel: all_gather → all ranks combine locally (no broadcast needed)
                     gathered = cfg_group.all_gather(pred, separate_tensors=True)
                     pred = self.cfg_operator(gathered[0], gathered[1], self.guidance_scale, step=i)
-                elif self.do_classifier_free_guidance:
+                elif do_true_cfg:
                     pred_cond, pred_uncond = pred.chunk(2)
                     pred = self.cfg_operator(pred_cond, pred_uncond, self.guidance_scale, step=i)
 

@@ -23,6 +23,7 @@ The full set of backends and their platform defaults is in the **Backend Options
 | `SAGE_ATTN_3` | Requires `sageattn3` from `SageAttention/sageattention3_blackwell`. CUDA only, intended for Blackwell GPUs, with GQA/MQA requests falling back to PyTorch SDPA. |
 | `FLASH_ATTN_HUB` | FlashAttention 2 from HuggingFace `kernels` library. Useful for train/rollout alignment. |
 | `FLASH_ATTN_3_HUB` | FlashAttention 3 from HuggingFace `kernels` library. CUDA Hopper (sm_90+) only; falls back to `FLASH_ATTN_HUB` on older GPUs. |
+| `MINDIE_SLA` | MindIE-SD SparseLinearAttention for the HunyuanImage3 diffusion role on Ascend NPU. Requires an exported SLA adapter; see [MindIE SLA](attention_backends/mindie_sla.md). |
 
 
 ## Configuration

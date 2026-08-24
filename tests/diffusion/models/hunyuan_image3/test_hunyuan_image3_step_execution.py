@@ -27,6 +27,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 def _pipeline():
     pipeline = object.__new__(HunyuanImage3Pipeline)
+    pipeline.hf_config = SimpleNamespace(cfg_distilled=False)
     pipeline._tkwrapper = SimpleNamespace(pad_token_id=0)
     pipeline.od_config = SimpleNamespace(
         diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="TORCH_SDPA")),
@@ -281,6 +282,73 @@ def test_later_step_merge_allows_request_local_step_counts_and_guidance_values()
 
     assert "guidance_scale" not in merged
     assert "num_inference_steps" not in merged
+
+
+def test_distilled_later_step_injects_guidance_without_cfg_batch(monkeypatch):
+    pipeline = _pipeline()
+    pipeline.hf_config.cfg_distilled = True
+    monkeypatch.setattr(HunyuanImage3Pipeline, "device", property(lambda self: torch.device("cpu")))
+    state = _state("distilled", 1)
+    state.extra[_STEP_GUIDANCE_SCALE] = 2.5
+    state.extra[_STEP_MODEL_KWARGS].update(
+        {
+            "attention_mask": torch.ones(1, 1, 2, 5, dtype=torch.bool),
+            "full_attn_spans": [[(3, 5)]],
+        }
+    )
+    state.extra[_STEP_PROMPT_KV] = [
+        {
+            "key": torch.zeros(1, 3, 1, 1),
+            "value": torch.zeros(1, 3, 1, 1),
+            "lens": torch.tensor([3]),
+        }
+    ]
+    captured: dict[str, object] = {}
+    pipeline._restore_prompt_kv_cache = lambda *_args: None
+
+    def fake_prepare_inputs(input_ids, images, timestep, **model_kwargs):
+        captured.update(model_kwargs)
+        captured["latent_batch"] = images.shape[0]
+        return {}
+
+    pipeline.prepare_inputs_for_generation = fake_prepare_inputs
+    pipeline.forward_call = lambda **_kwargs: {"diffusion_prediction": torch.ones(1, 1)}
+    pipeline._update_model_kwargs_for_generation = lambda _output, model_kwargs: model_kwargs
+
+    output = pipeline._denoise_step_group([state])
+
+    assert captured["latent_batch"] == 1
+    assert captured["guidance"].dtype == torch.bfloat16
+    torch.testing.assert_close(captured["guidance"], torch.tensor([2500.0], dtype=torch.bfloat16))
+    torch.testing.assert_close(output, torch.ones(1, 1))
+
+
+@pytest.mark.parametrize(("cfg_distilled", "special_tokens"), [(False, 1), (True, 2)])
+def test_ragged_final_layer_removes_checkpoint_specific_special_tokens(cfg_distilled, special_tokens):
+    pipeline = _pipeline()
+    pipeline.hf_config.cfg_distilled = cfg_distilled
+    captured: dict[str, torch.Tensor] = {}
+    pipeline.time_embed_2 = lambda timestep: timestep
+
+    def fake_final_layer(image_output, timestep_emb, token_h, token_w):
+        del timestep_emb, token_h, token_w
+        captured["image_output"] = image_output
+        return image_output
+
+    pipeline.final_layer = fake_final_layer
+    hidden_states = torch.arange((special_tokens + 3) * 2, dtype=torch.float32).reshape(1, special_tokens + 3, 2)
+
+    output = pipeline.ragged_final_layer(
+        hidden_states,
+        image_mask=None,
+        timestep=torch.tensor([1.0]),
+        token_h=1,
+        token_w=3,
+        first_step=False,
+    )
+
+    torch.testing.assert_close(captured["image_output"], hidden_states[:, special_tokens:])
+    torch.testing.assert_close(output, hidden_states[:, special_tokens:])
 
 
 @pytest.mark.parametrize(

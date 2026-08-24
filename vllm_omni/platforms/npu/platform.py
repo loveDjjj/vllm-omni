@@ -138,6 +138,11 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
                 )
                 backend_upper = "FLASH_ATTN"
 
+            if backend_upper in ("FLASH_ATTN", "MINDIE_SLA") and find_spec("mindiesd"):
+                # Register MindIE-SD custom operators before another CANN op
+                # causes the process-wide custom-op registry to be snapshotted.
+                import mindiesd  # noqa: F401
+
             backend = DiffusionAttentionBackendEnum[backend_upper]
             logger.debug("Using diffusion attention backend '%s'", backend_upper)
             return backend.get_path()
