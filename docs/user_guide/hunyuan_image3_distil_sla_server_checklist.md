@@ -23,7 +23,10 @@ Phase A-E 的代码、静态检查、CPU 测试和隔离 smoke test 已完成；
 python - <<'PY'
 import importlib.metadata
 
-for name in ("vllm", "vllm-omni", "vllm-ascend", "torch", "torch-npu", "safetensors"):
+for name in (
+    "vllm", "vllm-omni", "vllm-ascend", "torch", "torch-npu",
+    "safetensors", "diffusers", "cache-dit",
+):
     try:
         print(name, importlib.metadata.version(name))
     except Exception as exc:
@@ -73,11 +76,27 @@ git fetch origin hunyuan-image3-distil-sla-v0.26
 git switch hunyuan-image3-distil-sla-v0.26
 git pull --ff-only origin hunyuan-image3-distil-sla-v0.26
 git status --short --branch
-python -m pip install -e . --no-deps
+
+# 不能只执行 `pip install -e . --no-deps`。v0.27 容器或旧环境可能残留不兼容的
+# diffusers/cache-dit 组合。此脚本只校准这两个包，不修改 vLLM、vLLM-Ascend、
+# torch、torch_npu 或 CANN。
+bash scripts/install_hunyuan_image3_distil_sla_npu.sh
 
 # 必须使用含 SparseLinearAttention NPU op 的已验证 MindIE-SD 版本。
 python -m pip install -e /mnt/share/r50063443/HunyuanImage3-SLA/upstream/MindIE-SD --no-deps
 ```
+
+必须看到：
+
+```text
+diffusers 0.38.0
+cache-dit 1.3.0
+HunyuanImage3 import OK: HunyuanImage3Model
+```
+
+如果出现 `cannot import name 'ContextParallelConfig' from 'diffusers'`，说明实际运行
+环境没有完成上述依赖校准。`cache-dit==1.3.0` 会导入 Diffusers 的并行配置类型，
+而 v0.26 分支固定使用 `diffusers==0.38.0`。重新运行安装脚本后再启动服务。
 
 确认命令加载的是当前源码：
 
