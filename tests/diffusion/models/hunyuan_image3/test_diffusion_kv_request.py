@@ -26,6 +26,8 @@ from vllm_omni.diffusion.models.hunyuan_image3.request_layout import (
     hunyuan_num_image_tokens,
     normalize_hunyuan_cot_text,
     prepare_hunyuan_layout,
+    resolve_hunyuan_guidance_scale,
+    resolve_hunyuan_num_inference_steps,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -64,11 +66,13 @@ class _FakeTokenizerWrapper:
         self.calls.append(kwargs)
         rows = len(self.prefix_lens)
         has_cond_image = kwargs.get("batch_cond_image_info") is not None
-        seq_lens = [prefix_len + 20 for prefix_len in self.prefix_lens]
+        add_guidance = kwargs["batch_gen_image_info"][0].add_guidance_token
+        image_offset = 2 if add_guidance else 1
+        seq_lens = [prefix_len + 20 + int(add_guidance) for prefix_len in self.prefix_lens]
         padded_seq_len = max(seq_lens)
         positions = torch.arange(padded_seq_len)
         joint_image_slices = [[slice(1, 3), slice(3, 5)] if has_cond_image else [] for _ in range(rows)]
-        gen_image_slices = [[slice(length + 1, length + 17)] for length in self.prefix_lens]
+        gen_image_slices = [[slice(length + image_offset, length + image_offset + 16)] for length in self.prefix_lens]
         all_image_slices = [joint + generated for joint, generated in zip(joint_image_slices, gen_image_slices)]
         cond_vae_image_mask = (
             torch.stack([(positions >= 1) & (positions < 3) for _ in range(rows)]) if has_cond_image else None
@@ -93,10 +97,18 @@ class _FakeTokenizerWrapper:
             "output": TokenizerEncodeOutput(
                 tokens=torch.arange(rows * padded_seq_len, dtype=torch.long).reshape(rows, padded_seq_len),
                 gen_timestep_scatter_index=torch.tensor(self.prefix_lens, dtype=torch.long).reshape(rows, 1),
+                guidance_scatter_index=(
+                    torch.tensor([length + 1 for length in self.prefix_lens], dtype=torch.long).reshape(rows, 1)
+                    if add_guidance
+                    else None
+                ),
                 cond_timestep_scatter_index=(torch.zeros(rows, 1, dtype=torch.long) if has_cond_image else None),
                 all_image_slices=all_image_slices,
                 gen_image_mask=torch.stack(
-                    [(positions >= length + 1) & (positions < length + 17) for length in self.prefix_lens]
+                    [
+                        (positions >= length + image_offset) & (positions < length + image_offset + 16)
+                        for length in self.prefix_lens
+                    ]
                 ),
                 cond_vae_image_mask=cond_vae_image_mask,
                 cond_vit_image_mask=cond_vit_image_mask,
@@ -136,6 +148,8 @@ def _prepare(
     request: OmniDiffusionRequest,
     tokenizer: _FakeTokenizerWrapper,
     image_processor: _FakeImageProcessor,
+    *,
+    cfg_distilled: bool = False,
 ) -> HunyuanPreparedLayout:
     prepared_layout = prepare_hunyuan_layout(
         request,
@@ -143,6 +157,7 @@ def _prepare(
         image_processor=image_processor,
         generation_config=SimpleNamespace(sequence_template="instruct", drop_think=False),
         image_base_size=1024,
+        cfg_distilled=cfg_distilled,
     )
     request.prepared_layout = prepared_layout
     return prepared_layout
@@ -195,6 +210,33 @@ def test_builds_one_kv_request_per_cfg_row() -> None:
     assert [item.prefix_len for item in kv_requests] == [12, 14]
     assert [item.seq_len for item in kv_requests] == [32, 34]
     assert tokenizer.calls[0]["cfg_factor"] == 2
+
+
+def test_distilled_layout_uses_guidance_token_without_true_cfg_branch() -> None:
+    tokenizer, image_processor = _components([12])
+    request = _request(guidance_scale=2.5)
+
+    prepared_layout = _prepare(request, tokenizer, image_processor, cfg_distilled=True)
+    kv_requests = build_hunyuan_diffusion_kv_requests(request, prepared_layout)
+
+    assert prepared_layout.cfg_distilled is True
+    assert prepared_layout.generated_image_info.add_guidance_token is True
+    assert prepared_layout.tokenizer_output.guidance_scatter_index.tolist() == [[13]]
+    assert tokenizer.calls[0]["cfg_factor"] == 1
+    assert [(item.prefix_len, item.target_len) for item in kv_requests] == [(12, 18)]
+
+
+def test_hunyuan_distilled_defaults_are_checkpoint_scoped() -> None:
+    sampling = SimpleNamespace(
+        guidance_scale=1.0,
+        guidance_scale_provided=False,
+        num_inference_steps=None,
+    )
+
+    assert resolve_hunyuan_guidance_scale(sampling, 2.5) == 2.5
+    assert resolve_hunyuan_num_inference_steps(sampling, cfg_distilled=True) == 8
+    assert resolve_hunyuan_guidance_scale(sampling, 5.0) == 5.0
+    assert resolve_hunyuan_num_inference_steps(sampling, cfg_distilled=False) == 50
 
 
 def _reference_image() -> JointImageInfo:

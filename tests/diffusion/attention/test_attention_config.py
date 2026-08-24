@@ -10,6 +10,7 @@ Tests cover:
 - AttentionMetadata.extra field
 """
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -97,6 +98,47 @@ class TestAttentionSpec:
     def test_fastvideo_vsa_topk_rejected_for_other_backend(self):
         with pytest.raises(ValueError, match="only supported by the FASTVIDEO_VSA"):
             AttentionSpec(backend="TORCH_SDPA", fastvideo_vsa_topk=96)
+
+    def test_mindie_sla_config_serialized(self):
+        spec = AttentionSpec(
+            backend="MINDIE_SLA",
+            mindie_sla={"adapter_path": "~/sla", "topk": 0.25, "mask_policy": "hybrid"},
+        )
+        assert spec.backend_kwargs() == {
+            "adapter_path": os.path.expanduser("~/sla"),
+            "topk": 0.25,
+            "blkq": 64,
+            "blkk": 128,
+            "use_bf16": True,
+            "inner_precise": None,
+            "mask_policy": "hybrid",
+        }
+
+    def test_hunyuan_role_selects_only_diffusion_sla(self):
+        config = AttentionConfig(
+            default={"backend": "TORCH_SDPA"},
+            per_role={
+                "hunyuan": {
+                    "ar": {"backend": "TORCH_SDPA"},
+                    "diffusion": {
+                        "backend": "MINDIE_SLA",
+                        "mindie_sla": {"adapter_path": "/tmp/sla"},
+                    },
+                }
+            },
+        )
+        ar, _ = config.resolve_with_source(role="hunyuan.ar")
+        diffusion, _ = config.resolve_with_source(role="hunyuan.diffusion")
+        assert ar.backend == "TORCH_SDPA"
+        assert diffusion.backend == "MINDIE_SLA"
+
+    def test_mindie_sla_requires_adapter(self):
+        with pytest.raises(ValueError, match="requires a mindie_sla block"):
+            AttentionSpec(backend="MINDIE_SLA")
+
+    def test_mindie_sla_rejected_for_other_backend(self):
+        with pytest.raises(ValueError, match="only supported by the MINDIE_SLA"):
+            AttentionSpec(backend="TORCH_SDPA", mindie_sla={"adapter_path": "/tmp/sla"})
 
     def test_block_sparse_defaults_applied_when_backend_selected(self):
         spec = AttentionSpec(backend="RAINFUSION_ATTN")

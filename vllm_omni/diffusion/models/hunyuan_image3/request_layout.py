@@ -194,6 +194,13 @@ def resolve_hunyuan_guidance_scale(sampling: Any, default_scale: float = 5.0) ->
     return default_scale
 
 
+def resolve_hunyuan_num_inference_steps(sampling: Any, *, cfg_distilled: bool) -> int:
+    steps = getattr(sampling, "num_inference_steps", None)
+    if steps is not None:
+        return int(steps)
+    return 8 if cfg_distilled else 50
+
+
 def hunyuan_num_image_tokens(image_info: ImageInfo) -> int:
     """Return the generated-image span overwritten on every denoise step."""
 
@@ -242,6 +249,7 @@ def prepare_hunyuan_layout(
     image_processor: HunyuanImage3ImageProcessor,
     generation_config: GenerationConfig,
     image_base_size: int,
+    cfg_distilled: bool = False,
 ) -> HunyuanPreparedLayout:
     """Build the CPU token/image layout reused by Scheduler and Worker."""
 
@@ -260,8 +268,11 @@ def prepare_hunyuan_layout(
     )
     height = sampling.height or 1024
     width = sampling.width or 1024
-    guidance_scale = resolve_hunyuan_guidance_scale(sampling)
-    generated_image_info = image_processor.build_image_info((height, width))
+    guidance_scale = resolve_hunyuan_guidance_scale(sampling, 2.5 if cfg_distilled else 5.0)
+    generated_image_info = image_processor.build_image_info(
+        (height, width),
+        add_guidance_token=cfg_distilled,
+    )
     result = tokenizer_wrapper.apply_chat_template(
         batch_prompt=prompt,
         mode="gen_image",
@@ -273,7 +284,7 @@ def prepare_hunyuan_layout(
         bot_task=tokenizer_bot_task,
         image_base_size=image_base_size,
         sequence_template=getattr(generation_config, "sequence_template", "pretrain"),
-        cfg_factor=1 + int(guidance_scale > 1.0),
+        cfg_factor=1 if cfg_distilled else 1 + int(guidance_scale > 1.0),
         drop_think=getattr(generation_config, "drop_think", False),
     )
     tokenizer_output = result["output"]
@@ -281,6 +292,7 @@ def prepare_hunyuan_layout(
         tokenizer_output=tokenizer_output,
         rope_image_info=build_hunyuan_batch_rope_image_info(tokenizer_output, result["sections"]),
         generated_image_info=generated_image_info,
+        cfg_distilled=cfg_distilled,
     )
 
 
@@ -291,6 +303,7 @@ class HunyuanPreparedLayout:
     tokenizer_output: TokenizerEncodeOutput
     rope_image_info: list[list[tuple[slice, tuple[int, int]]]]
     generated_image_info: ImageInfo
+    cfg_distilled: bool = False
 
     def __post_init__(self) -> None:
         tokens = self.tokenizer_output.tokens
@@ -310,6 +323,19 @@ class HunyuanPreparedLayout:
                 "Hunyuan prepared prefix-position rows do not match tokenizer rows: "
                 f"prefix_positions={prefix_positions.shape[0]}, tokens={int(tokens.shape[0])}"
             )
+        if self.cfg_distilled:
+            guidance_positions = self.tokenizer_output.guidance_scatter_index
+            if (
+                not self.generated_image_info.add_guidance_token
+                or guidance_positions is None
+                or guidance_positions.ndim != 2
+                or guidance_positions.shape != prefix_positions.shape
+            ):
+                shape = None if guidance_positions is None else tuple(guidance_positions.shape)
+                raise ValueError(
+                    "Distilled Hunyuan prepared layout requires one guidance token per execution row: "
+                    f"guidance_shape={shape}, timestep_shape={tuple(prefix_positions.shape)}"
+                )
         real_pos = self.tokenizer_output.real_pos
         if real_pos is None or real_pos.ndim != 2 or real_pos.shape[1] == 0:
             raise ValueError("Hunyuan prepared layout requires a non-empty 2-D real_pos")
@@ -337,7 +363,10 @@ def build_hunyuan_diffusion_kv_requests(
     """Build one persistent Scheduler KV request per Hunyuan execution row."""
 
     tokenizer_output = prepared_layout.tokenizer_output
-    cfg_factor = 1 + int(resolve_hunyuan_guidance_scale(request.sampling_params) > 1.0)
+    guidance_scale = resolve_hunyuan_guidance_scale(
+        request.sampling_params, 2.5 if prepared_layout.cfg_distilled else 5.0
+    )
+    cfg_factor = 1 if prepared_layout.cfg_distilled else 1 + int(guidance_scale > 1.0)
     if prepared_layout.num_branches != cfg_factor:
         raise ValueError(
             "Hunyuan tokenizer sequence count does not match CFG execution: "

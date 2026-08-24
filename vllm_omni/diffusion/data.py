@@ -1642,6 +1642,34 @@ class BlockSparseSpec:
 
 
 @dataclass
+class MindIESLASpec:
+    """Configuration for the MindIE-SD SparseLinearAttention backend."""
+
+    adapter_path: str
+    topk: float = 0.125
+    blkq: int = 64
+    blkk: int = 128
+    use_bf16: bool = True
+    inner_precise: int | None = None
+    mask_policy: str = "hybrid"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.adapter_path, str) or not self.adapter_path.strip():
+            raise ValueError("mindie_sla.adapter_path must be a non-empty path.")
+        self.adapter_path = os.path.expandvars(os.path.expanduser(self.adapter_path))
+        if not 0.0 < float(self.topk) <= 1.0:
+            raise ValueError(f"mindie_sla.topk must be in (0, 1]; got {self.topk!r}.")
+        if self.blkq <= 0 or self.blkk <= 0:
+            raise ValueError(f"mindie_sla.blkq and mindie_sla.blkk must be positive; got {self.blkq}, {self.blkk}.")
+        if self.blkk % 128 != 0:
+            raise ValueError(f"mindie_sla.blkk must be a multiple of 128 for AscendC; got {self.blkk}.")
+        if self.mask_policy not in {"hybrid", "error", "dense_fallback"}:
+            raise ValueError(
+                f"mindie_sla.mask_policy must be one of hybrid, error, or dense_fallback; got {self.mask_policy!r}."
+            )
+
+
+@dataclass
 class AttentionSpec:
     """Specifies a backend and its typed backend-specific config for one attention role."""
 
@@ -1650,6 +1678,7 @@ class AttentionSpec:
     quant: AttnQuantSpec | None = None
     fastvideo_vsa_topk: int | None = None
     block_sparse: BlockSparseSpec | None = None
+    mindie_sla: MindIESLASpec | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -1658,6 +1687,7 @@ class AttentionSpec:
         self.skip_softmax = self._coerce(self.skip_softmax, SkipSoftmaxSpec, "skip_softmax")
         self.quant = self._coerce(self.quant, AttnQuantSpec, "quant")
         self.block_sparse = self._coerce(self.block_sparse, BlockSparseSpec, "block_sparse")
+        self.mindie_sla = self._coerce(self.mindie_sla, MindIESLASpec, "mindie_sla")
         if self.skip_softmax is not None and self.backend.upper() != "TRTLLM_ATTN":
             raise ValueError(
                 f"skip_softmax is only supported by the TRTLLM_ATTN backend, but backend={self.backend!r}. "
@@ -1682,6 +1712,11 @@ class AttentionSpec:
                 f"block_sparse is only supported by the {sorted(BLOCK_SPARSE_BACKENDS)} backends, but "
                 f"backend={self.backend!r}. Remove block_sparse or set a supported backend."
             )
+        if self.backend.upper() == "MINDIE_SLA":
+            if self.mindie_sla is None:
+                raise ValueError("MINDIE_SLA requires a mindie_sla block with adapter_path.")
+        elif self.mindie_sla is not None:
+            raise ValueError(f"mindie_sla is only supported by the MINDIE_SLA backend, but backend={self.backend!r}.")
 
     @staticmethod
     def _coerce(value: Any, cls: type, field_name: str) -> Any:
@@ -1722,6 +1757,17 @@ class AttentionSpec:
             kw["start_step"] = bs.start_step
             if bs.skip_layer_indices:
                 kw["skip_layers"] = sorted(bs.skip_layer_indices)
+        if self.mindie_sla is not None:
+            sla = self.mindie_sla
+            kw.update(
+                adapter_path=sla.adapter_path,
+                topk=float(sla.topk),
+                blkq=sla.blkq,
+                blkk=sla.blkk,
+                use_bf16=sla.use_bf16,
+                inner_precise=sla.inner_precise,
+                mask_policy=sla.mask_policy,
+            )
 
         return kw or None
 
@@ -1792,7 +1838,7 @@ class AttentionConfig:
             normalized[role] = node
             return
 
-        spec_keys = {"backend", "skip_softmax", "quant", "fastvideo_vsa_topk", "block_sparse"}
+        spec_keys = {"backend", "skip_softmax", "quant", "fastvideo_vsa_topk", "block_sparse", "mindie_sla"}
         node_dict = dict(node)
         node_keys = set(node_dict)
         if node_keys & spec_keys:

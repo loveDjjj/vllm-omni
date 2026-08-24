@@ -177,8 +177,8 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
                 )
                 backend_upper = "FLASH_ATTN"
 
-            if backend_upper == "FLASH_ATTN" and find_spec("mindiesd"):
-                # The NPU FLASH_ATTN backend imports mindiesd lazily at first
+            if backend_upper in ("FLASH_ATTN", "MINDIE_SLA") and find_spec("mindiesd"):
+                # MindIE-backed NPU attention imports mindiesd lazily at first
                 # forward, but CANN snapshots the custom-op registry at the
                 # first custom-op regInfo lookup in the process (e.g. a
                 # vllm-ascend custom op during model load/warmup). Import
