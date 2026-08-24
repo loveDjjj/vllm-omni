@@ -309,20 +309,34 @@ class DiffusersPipelineLoader:
     def _get_expected_parameter_names(self, model: nn.Module) -> set[str]:
         """Return parameter names that should be covered by strict load checks."""
         all_parameter_names = {name for name, _ in model.named_parameters()}
+        external_provider = getattr(model, "get_externally_loaded_parameter_names", None)
+        externally_loaded = set() if external_provider is None else set(external_provider())
+        unknown_external = externally_loaded - all_parameter_names
+        if unknown_external:
+            raise ValueError(
+                f"Model declared externally loaded parameters that are not registered: {sorted(unknown_external)}"
+            )
+        if externally_loaded:
+            logger.info_once(
+                "Strict checkpoint validation excludes %d parameters supplied by external artifacts.",
+                len(externally_loaded),
+            )
         sources = self._get_weight_sources(model)
 
         # Keep strict behavior if no source metadata exists.
         if not sources:
-            return all_parameter_names
+            return all_parameter_names - externally_loaded
 
         # Empty prefix means "root" source, i.e. entire model should be covered.
         if any(source.prefix == "" for source in sources):
-            return all_parameter_names
+            return all_parameter_names - externally_loaded
 
         source_prefixes = tuple(source.prefix for source in sources if source.prefix)
         if not source_prefixes:
             return all_parameter_names
-        return {name for name in all_parameter_names if name.startswith(source_prefixes)}
+        return {
+            name for name in all_parameter_names if name.startswith(source_prefixes) and name not in externally_loaded
+        }
 
     def load_model(
         self,

@@ -67,6 +67,15 @@ class _DummyPipelineModel(nn.Module):
         return loaded
 
 
+class _ExternalWeightsPipelineModel(_DummyPipelineModel):
+    def __init__(self):
+        super().__init__(source_prefix="")
+        self.adapter = nn.Linear(2, 2, bias=False)
+
+    def get_externally_loaded_parameter_names(self) -> set[str]:
+        return {"adapter.weight"}
+
+
 def _make_loader_with_weights(weight_names: list[str]) -> DiffusersPipelineLoader:
     od_config = SimpleNamespace(
         dtype=torch.float32,
@@ -107,6 +116,22 @@ def test_empty_source_prefix_keeps_full_model_strict_check():
     loader = _make_loader_with_weights(["transformer.weight"])
 
     with pytest.raises(ValueError, match="vae.weight"):
+        loader.load_weights(model)
+
+
+def test_strict_check_excludes_parameters_supplied_by_external_artifact():
+    model = _ExternalWeightsPipelineModel()
+    loader = _make_loader_with_weights(["transformer.weight", "vae.weight"])
+
+    loader.load_weights(model)
+
+
+def test_strict_check_rejects_unknown_external_parameter_claim():
+    model = _ExternalWeightsPipelineModel()
+    model.get_externally_loaded_parameter_names = lambda: {"missing.weight"}  # type: ignore[method-assign]
+    loader = _make_loader_with_weights(["transformer.weight", "vae.weight"])
+
+    with pytest.raises(ValueError, match="not registered.*missing.weight"):
         loader.load_weights(model)
 
 

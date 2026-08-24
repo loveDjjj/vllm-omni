@@ -234,6 +234,13 @@ class MindIESLAImpl(nn.Module, AttentionImpl):
         )
         self._adapter_installed = False
 
+    def get_externally_loaded_parameter_names(self, prefix: str) -> set[str]:
+        """Return parameters supplied by the validated SLA artifact."""
+        return {
+            f"{prefix}.sla.proj_l.weight",
+            f"{prefix}.sla.proj_l.bias",
+        }
+
     def _install_adapter(self) -> None:
         if self._adapter_installed:
             return

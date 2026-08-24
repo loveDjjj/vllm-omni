@@ -98,6 +98,19 @@ HunyuanImage3 import OK: HunyuanImage3Model
 环境没有完成上述依赖校准。`cache-dit==1.3.0` 会导入 Diffusers 的并行配置类型，
 而 v0.26 分支固定使用 `diffusers==0.38.0`。重新运行安装脚本后再启动服务。
 
+如果基础 checkpoint 严格校验报告
+`sla.proj_l.weight/bias were not initialized from checkpoint`，不要把 SLA adapter 合并进
+基础模型。SLA 参数来自独立的 `adapter.safetensors`，不是基础 checkpoint 的组成部分。
+更新本分支后，启动日志必须先出现 adapter 校验成功，并随后出现：
+
+```text
+Validated HunyuanImage3 SLA adapter ... tensors=64 ...
+Strict checkpoint validation excludes 64 parameters supplied by external artifacts.
+```
+
+第一条缺失表示 `HUNYUAN_SLA_ADAPTER`、adapter 文件或配置不正确；第一条存在但第二条
+缺失表示运行的不是包含外部参数加载契约的最新源码。
+
 确认命令加载的是当前源码：
 
 ```bash

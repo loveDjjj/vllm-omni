@@ -127,6 +127,16 @@ def test_adapter_is_installed_lazily_after_model_initialization(fake_mindiesd, t
     assert impl._adapter_installed
 
 
+def test_adapter_declares_runtime_parameters_as_externally_loaded(fake_mindiesd, tmp_path):
+    _load_adapter.cache_clear()
+    impl = _make_impl(_make_adapter(tmp_path))
+
+    assert impl.get_externally_loaded_parameter_names("model.layers.1.attention") == {
+        "model.layers.1.attention.sla.proj_l.weight",
+        "model.layers.1.attention.sla.proj_l.bias",
+    }
+
+
 def test_adapter_sha_mismatch_rejected(fake_mindiesd, tmp_path):
     _load_adapter.cache_clear()
     with pytest.raises(ValueError, match="SHA256 mismatch"):

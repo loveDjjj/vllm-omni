@@ -500,6 +500,17 @@ class HunyuanImage3Pipeline(
         )
         return loader.load_weights(weights)
 
+    def get_externally_loaded_parameter_names(self) -> set[str]:
+        """Collect parameters supplied by runtime attention adapters."""
+        names: set[str] = set()
+        for module_prefix, module in self.named_modules():
+            if module is self:
+                continue
+            provider = getattr(module, "get_externally_loaded_parameter_names", None)
+            if provider is not None:
+                names.update(provider(module_prefix))
+        return names
+
     @property
     def cfg_distilled(self) -> bool:
         return bool(getattr(self.hf_config, "cfg_distilled", False))
