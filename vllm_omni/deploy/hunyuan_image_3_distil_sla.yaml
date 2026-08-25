@@ -1,5 +1,6 @@
 # HunyuanImage-3.0-Instruct-Distil + MindIE-SD SLA, Ascend NPU TP8.
-# Set HUNYUAN_SLA_ADAPTER to the exported adapter directory before launch.
+# Set HUNYUAN_SLA_ADAPTER to a v1 proj-only or v2 QKV/O-delta adapter directory.
+# v2 attention deltas are applied before tensor-parallel checkpoint sharding.
 pipeline: hunyuan_image_3_moe
 async_chunk: false
 trust_remote_code: true

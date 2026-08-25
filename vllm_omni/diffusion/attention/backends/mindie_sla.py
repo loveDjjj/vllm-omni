@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
+from collections.abc import Iterable, Iterator
 from functools import lru_cache
 from importlib.util import find_spec
 from pathlib import Path
@@ -14,7 +16,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from safetensors.torch import load_file
+from safetensors import safe_open
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import (
@@ -27,9 +29,13 @@ from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import build_se
 
 logger = init_logger(__name__)
 
-_FORMAT_VERSION = 1
+_SUPPORTED_FORMAT_VERSIONS = frozenset({1, 2})
 _ARCHITECTURE = "HunyuanImage3SparseLinearAttentionAdapter"
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+_ATTENTION_WEIGHT_RE = re.compile(
+    r"(?:^|\.)layers\.(\d+)\.(?:module\.)?self_attn\."
+    r"(qkv_proj|q_proj|k_proj|v_proj|o_proj)\.weight$"
+)
 _VALID_MASK_POLICIES = frozenset({"hybrid", "error", "dense_fallback"})
 
 
@@ -62,9 +68,11 @@ def _load_adapter(adapter_path: str) -> tuple[dict[str, Any], dict[str, torch.Te
     config = json.loads(config_path.read_text(encoding="utf-8"))
     if not isinstance(config, dict):
         raise TypeError(f"MindIE SLA adapter config must be a JSON object: {config_path}")
-    if config.get("format_version") != _FORMAT_VERSION:
+    format_version = int(config.get("format_version", 0))
+    if format_version not in _SUPPORTED_FORMAT_VERSIONS:
         raise ValueError(
-            f"Unsupported SLA adapter format_version={config.get('format_version')!r}; expected {_FORMAT_VERSION}."
+            f"Unsupported SLA adapter format_version={format_version!r}; "
+            f"expected one of {sorted(_SUPPORTED_FORMAT_VERSIONS)}."
         )
     if config.get("architecture") != _ARCHITECTURE:
         raise ValueError(
@@ -81,36 +89,115 @@ def _load_adapter(adapter_path: str) -> tuple[dict[str, Any], dict[str, torch.Te
     head_dim = int(config.get("head_dim", 0))
     if num_layers <= 0 or head_dim <= 0:
         raise ValueError(f"Invalid SLA adapter geometry: num_layers={num_layers}, head_dim={head_dim}.")
-    tensors = load_file(str(weights_path), device="cpu")
+    components = tuple(config.get("trained_components", ("proj_l",)))
+    if not components or components[0] != "proj_l":
+        raise ValueError(f"SLA adapter must include proj_l; got trained_components={components}.")
+    valid_components = {"proj_l", "qkv_delta", "o_delta"}
+    if set(components) - valid_components:
+        raise ValueError(f"Unsupported SLA adapter trained_components={components}.")
     expected_keys = {
         f"layers.{layer}.sla.proj_l.{parameter}" for layer in range(num_layers) for parameter in ("weight", "bias")
     }
-    missing = sorted(expected_keys - set(tensors))
-    unexpected = sorted(set(tensors) - expected_keys)
-    if missing or unexpected:
-        raise ValueError(f"Invalid SLA adapter keys: missing={missing or 'none'}, unexpected={unexpected or 'none'}")
-    for name, tensor in tensors.items():
-        expected_shape = (head_dim,) if name.endswith(".bias") else (head_dim, head_dim)
-        if tuple(tensor.shape) != expected_shape:
+    if "qkv_delta" in components:
+        expected_keys.update(f"layers.{layer}.qkv_delta.weight" for layer in range(num_layers))
+    if "o_delta" in components:
+        expected_keys.update(f"layers.{layer}.o_delta.weight" for layer in range(num_layers))
+    hidden_size = int(config.get("hidden_size", 4096))
+    q_heads = int(config.get("q_heads", 32))
+    kv_heads = int(config.get("kv_heads", 8))
+    qkv_size = head_dim * (q_heads + 2 * kv_heads)
+    expected_shapes = {
+        "sla.proj_l.weight": (head_dim, head_dim),
+        "sla.proj_l.bias": (head_dim,),
+        "qkv_delta.weight": (qkv_size, hidden_size),
+        "o_delta.weight": (hidden_size, q_heads * head_dim),
+    }
+    proj_tensors: dict[str, torch.Tensor] = {}
+    parameter_count = 0
+    with safe_open(str(weights_path), framework="pt", device="cpu") as handle:
+        actual_keys = set(handle.keys())
+        missing = sorted(expected_keys - actual_keys)
+        unexpected = sorted(actual_keys - expected_keys)
+        if missing or unexpected:
             raise ValueError(
-                f"Invalid SLA tensor shape for {name}: expected {expected_shape}, got {tuple(tensor.shape)}"
+                f"Invalid SLA adapter keys: missing={missing or 'none'}, unexpected={unexpected or 'none'}"
             )
-        if not tensor.is_floating_point() or not torch.isfinite(tensor).all().item():
-            raise ValueError(f"SLA adapter tensor must be finite floating point: {name} ({tensor.dtype})")
-    if int(config.get("tensor_count", -1)) != len(tensors):
+        for name in sorted(actual_keys):
+            suffix = name.split(f"layers.{_layer_index(name)}.", 1)[1]
+            shape = tuple(handle.get_slice(name).get_shape())
+            expected_shape = expected_shapes[suffix]
+            if shape != expected_shape:
+                raise ValueError(
+                    f"Invalid SLA tensor shape for {name}: expected {expected_shape}, got {shape}"
+                )
+            parameter_count += math.prod(shape)
+            if ".sla.proj_l." in name:
+                tensor = handle.get_tensor(name)
+                if not tensor.is_floating_point() or not torch.isfinite(tensor).all().item():
+                    raise ValueError(f"SLA adapter tensor must be finite floating point: {name} ({tensor.dtype})")
+                proj_tensors[name] = tensor
+    if int(config.get("tensor_count", -1)) != len(expected_keys):
         raise ValueError("SLA adapter tensor_count does not match adapter.safetensors.")
-    parameter_count = sum(tensor.numel() for tensor in tensors.values())
     if int(config.get("parameter_count", -1)) != parameter_count:
         raise ValueError("SLA adapter parameter_count does not match adapter.safetensors.")
     logger.info(
         "Validated HunyuanImage3 SLA adapter %s: layers=%d, tensors=%d, parameters=%d, sha256=%s",
         weights_path,
         num_layers,
-        len(tensors),
+        len(expected_keys),
         parameter_count,
         actual_sha,
     )
-    return config, tensors
+    return config, proj_tensors
+
+
+def _split_interleaved_qkv(delta: torch.Tensor, config: dict[str, Any]) -> dict[str, torch.Tensor]:
+    q_heads = int(config.get("q_heads", 32))
+    kv_heads = int(config.get("kv_heads", 8))
+    head_dim = int(config["head_dim"])
+    groups = q_heads // kv_heads
+    if q_heads % kv_heads:
+        raise ValueError(f"SLA adapter Q heads must be divisible by KV heads: {q_heads=}, {kv_heads=}.")
+    reshaped = delta.reshape(kv_heads, groups + 2, head_dim, delta.shape[1])
+    q, k, v = torch.split(reshaped, (groups, 1, 1), dim=1)
+    return {
+        "q_proj": q.reshape(-1, delta.shape[1]),
+        "k_proj": k.reshape(-1, delta.shape[1]),
+        "v_proj": v.reshape(-1, delta.shape[1]),
+    }
+
+
+def apply_attention_deltas(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    adapter_path: str,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Add full-rank QKV/O deltas before vLLM performs tensor-parallel sharding."""
+    config, _ = _load_adapter(adapter_path)
+    components = set(config.get("trained_components", ("proj_l",)))
+    if not components.intersection({"qkv_delta", "o_delta"}):
+        yield from weights
+        return
+    weights_path, _ = _resolve_adapter_paths(adapter_path)
+    with safe_open(str(weights_path), framework="pt", device="cpu") as handle:
+        for name, tensor in weights:
+            match = _ATTENTION_WEIGHT_RE.search(name)
+            if match is None:
+                yield name, tensor
+                continue
+            layer, projection = int(match.group(1)), match.group(2)
+            delta = None
+            if projection == "o_proj" and "o_delta" in components:
+                delta = handle.get_tensor(f"layers.{layer}.o_delta.weight")
+            elif projection in {"qkv_proj", "q_proj", "k_proj", "v_proj"} and "qkv_delta" in components:
+                packed = handle.get_tensor(f"layers.{layer}.qkv_delta.weight")
+                delta = packed if projection == "qkv_proj" else _split_interleaved_qkv(packed, config)[projection]
+            if delta is not None:
+                if tuple(delta.shape) != tuple(tensor.shape):
+                    raise ValueError(
+                        f"SLA delta shape mismatch for {name}: base={tuple(tensor.shape)}, delta={tuple(delta.shape)}."
+                    )
+                tensor = tensor + delta.to(device=tensor.device, dtype=tensor.dtype)
+            yield name, tensor
 
 
 def _layer_index(prefix: str) -> int:

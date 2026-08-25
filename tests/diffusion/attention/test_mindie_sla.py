@@ -18,6 +18,7 @@ from vllm_omni.diffusion.attention.backends.mindie_sla import (
     MindIESLAImpl,
     _load_adapter,
     _repeat_gqa_kv,
+    apply_attention_deltas,
 )
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
 
@@ -71,6 +72,36 @@ def _make_adapter(tmp_path, *, corrupt_sha=False):
     }
     (tmp_path / "adapter_config.json").write_text(json.dumps(config), encoding="utf-8")
     return tmp_path
+
+
+def _make_v2_adapter(tmp_path):
+    tensors = {}
+    for layer in range(2):
+        tensors[f"layers.{layer}.sla.proj_l.weight"] = torch.full((2, 2), float(layer + 1))
+        tensors[f"layers.{layer}.sla.proj_l.bias"] = torch.full((2,), float(layer + 1))
+        tensors[f"layers.{layer}.qkv_delta.weight"] = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+        tensors[f"layers.{layer}.o_delta.weight"] = torch.full((4, 4), float(layer + 3))
+    weights = tmp_path / "adapter.safetensors"
+    save_file(tensors, str(weights))
+    config = {
+        "format_version": 2,
+        "architecture": "HunyuanImage3SparseLinearAttentionAdapter",
+        "num_layers": 2,
+        "head_dim": 2,
+        "hidden_size": 4,
+        "q_heads": 2,
+        "kv_heads": 1,
+        "trained_components": ["proj_l", "qkv_delta", "o_delta"],
+        "topk": 0.125,
+        "blkq": 64,
+        "blkk": 128,
+        "compute_dtype": "bfloat16",
+        "tensor_count": len(tensors),
+        "parameter_count": sum(t.numel() for t in tensors.values()),
+        "adapter_sha256": hashlib.sha256(weights.read_bytes()).hexdigest(),
+    }
+    (tmp_path / "adapter_config.json").write_text(json.dumps(config), encoding="utf-8")
+    return tmp_path, tensors
 
 
 def _make_impl(adapter_path):
@@ -143,6 +174,53 @@ def test_adapter_sha_mismatch_rejected(fake_mindiesd, tmp_path):
     _load_adapter.cache_clear()
     with pytest.raises(ValueError, match="SHA256 mismatch"):
         _make_impl(_make_adapter(tmp_path, corrupt_sha=True))
+
+
+def test_v2_attention_deltas_are_added_before_tp_loading(tmp_path):
+    _load_adapter.cache_clear()
+    adapter, tensors = _make_v2_adapter(tmp_path)
+    base_weights = [
+        ("model.layers.0.self_attn.qkv_proj.weight", torch.zeros(8, 4)),
+        ("model.layers.0.self_attn.o_proj.weight", torch.ones(4, 4)),
+        ("model.layers.0.input_layernorm.weight", torch.ones(4)),
+    ]
+
+    loaded = dict(apply_attention_deltas(iter(base_weights), str(adapter)))
+
+    torch.testing.assert_close(
+        loaded["model.layers.0.self_attn.qkv_proj.weight"],
+        tensors["layers.0.qkv_delta.weight"],
+    )
+    torch.testing.assert_close(
+        loaded["model.layers.0.self_attn.o_proj.weight"],
+        torch.ones(4, 4) + tensors["layers.0.o_delta.weight"],
+    )
+    torch.testing.assert_close(loaded["model.layers.0.input_layernorm.weight"], torch.ones(4))
+
+
+def test_v2_packed_qkv_delta_supports_split_checkpoints(tmp_path):
+    _load_adapter.cache_clear()
+    adapter, tensors = _make_v2_adapter(tmp_path)
+    names_and_shapes = {
+        "q_proj": (4, 4),
+        "k_proj": (2, 4),
+        "v_proj": (2, 4),
+    }
+    base_weights = [
+        (f"model.layers.0.self_attn.{name}.weight", torch.zeros(shape))
+        for name, shape in names_and_shapes.items()
+    ]
+
+    loaded = dict(apply_attention_deltas(iter(base_weights), str(adapter)))
+    packed = tensors["layers.0.qkv_delta.weight"].reshape(1, 4, 2, 4)
+    q, k, v = torch.split(packed, (2, 1, 1), dim=1)
+    expected = {
+        "q_proj": q.reshape(4, 4),
+        "k_proj": k.reshape(2, 4),
+        "v_proj": v.reshape(2, 4),
+    }
+    for projection, tensor in expected.items():
+        torch.testing.assert_close(loaded[f"model.layers.0.self_attn.{projection}.weight"], tensor)
 
 
 def test_gqa_repeat_is_idempotent_after_hunyuan_repeat():

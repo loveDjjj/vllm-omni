@@ -498,6 +498,13 @@ class HunyuanImage3Pipeline(
             self,
             skip_prefixes=skip_prefixes,
         )
+        spec, _ = self.od_config.diffusion_attention_config.resolve_with_source(role="hunyuan.diffusion")
+        if spec is not None and spec.backend.upper() == "MINDIE_SLA" and spec.mindie_sla is not None:
+            from vllm_omni.diffusion.attention.backends.mindie_sla import (
+                apply_attention_deltas,
+            )
+
+            weights = apply_attention_deltas(weights, spec.mindie_sla.adapter_path)
         return loader.load_weights(weights)
 
     def get_externally_loaded_parameter_names(self) -> set[str]:
