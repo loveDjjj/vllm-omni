@@ -74,6 +74,14 @@ _STEP_PROMPT_KV = "hunyuan_prompt_kv"
 _HUNYUAN_DEFAULT_OUTPUT_TYPE = "pil"
 
 
+def _get_meanflow_timestep_r(scheduler, timestep: torch.Tensor) -> torch.Tensor:
+    if hasattr(scheduler, "get_timestep_r"):
+        return scheduler.get_timestep_r(timestep)
+    if scheduler.step_index is None:
+        scheduler._init_step_index(timestep)
+    return scheduler.sigmas[scheduler.step_index + 1] * scheduler.config.num_train_timesteps
+
+
 def default(val, d):
     return val if val is not None else d
 
@@ -439,6 +447,8 @@ class HunyuanImage3Pipeline(
         self.timestep_emb = TimestepEmbedder(hidden_size=self.hf_config.hidden_size)
         if self.cfg_distilled:
             self.guidance_emb = TimestepEmbedder(hidden_size=self.hf_config.hidden_size)
+        if self.use_meanflow:
+            self.timestep_r_emb = TimestepEmbedder(hidden_size=self.hf_config.hidden_size)
         if self.hf_config.img_proj_type != "unet":
             raise ValueError(f"Unknown img_proj_type: {self.hf_config.img_proj_type}")
 
@@ -477,6 +487,7 @@ class HunyuanImage3Pipeline(
             "patch_embed",
             "timestep_emb",
             "guidance_emb",
+            "timestep_r_emb",
             "model.wte",
             "model.ln_f",
             "time_embed",
@@ -490,7 +501,7 @@ class HunyuanImage3Pipeline(
             if mod:
                 mod.to(device)
 
-        unexpected_keywords = ["timestep_r_emb"]
+        unexpected_keywords = []
         if not self.cfg_distilled:
             unexpected_keywords.append("guidance_emb")
         skip_prefixes.extend(unexpected_keywords)
@@ -521,6 +532,10 @@ class HunyuanImage3Pipeline(
     @property
     def cfg_distilled(self) -> bool:
         return bool(getattr(self.hf_config, "cfg_distilled", False))
+
+    @property
+    def use_meanflow(self) -> bool:
+        return bool(getattr(self.hf_config, "use_meanflow", False))
 
     def prepare_seed(self, seed=None, batch_size=1):
         # random seed
@@ -1100,7 +1115,7 @@ class HunyuanImage3Pipeline(
         if first_step:
             image_output = x.masked_select(image_mask.unsqueeze(-1).bool()).reshape(bsz, -1, n_embd)
         else:
-            num_special_tokens = 2 if self.cfg_distilled else 1
+            num_special_tokens = 1 + int(self.cfg_distilled) + int(self.use_meanflow)
             image_output = x[:, num_special_tokens:, :]
         timestep_emb = self.time_embed_2(timestep)
         pred = self.final_layer(image_output, timestep_emb, token_h, token_w)
@@ -1326,6 +1341,7 @@ class HunyuanImage3Pipeline(
                     self.image_processor.build_image_info(
                         image_size,
                         add_guidance_token=self.cfg_distilled,
+                        add_timestep_r_token=self.use_meanflow,
                     )
                     for _ in range(batch_size)
                 ]
@@ -1450,6 +1466,7 @@ class HunyuanImage3Pipeline(
             image_mask=to_device(output.gen_image_mask, device),
             gen_timestep_scatter_index=output.gen_timestep_scatter_index,
             guidance_scatter_index=to_device(output.guidance_scatter_index, device),
+            timesteps_r_scatter_index=to_device(output.gen_timestep_r_scatter_index, device),
             cond_vae_images=to_device(cond_vae_images, device),
             cond_timestep=to_device(cond_timestep, device),
             cond_vae_image_mask=to_device(output.cond_vae_image_mask, device),
@@ -1536,6 +1553,8 @@ class HunyuanImage3Pipeline(
                 "gen_timestep_scatter_index": kwargs.get("gen_timestep_scatter_index"),
                 "guidance": kwargs.get("guidance"),
                 "guidance_scatter_index": kwargs.get("guidance_scatter_index"),
+                "timestep_r": kwargs.get("timestep_r"),
+                "timesteps_r_scatter_index": kwargs.get("timesteps_r_scatter_index"),
                 "cond_vae_images": kwargs.get("cond_vae_images"),
                 "cond_timestep": kwargs.get("cond_timestep"),
                 "cond_vae_image_mask": kwargs.get("cond_vae_image_mask"),
@@ -1568,6 +1587,8 @@ class HunyuanImage3Pipeline(
         }
         if "guidance_scatter_index" in model_kwargs:
             updated_model_kwargs["guidance_scatter_index"] = model_kwargs["guidance_scatter_index"]
+        if "timesteps_r_scatter_index" in model_kwargs:
+            updated_model_kwargs["timesteps_r_scatter_index"] = model_kwargs["timesteps_r_scatter_index"]
         if "full_attn_spans" in model_kwargs:
             updated_model_kwargs["full_attn_spans"] = model_kwargs["full_attn_spans"]
 
@@ -1606,6 +1627,11 @@ class HunyuanImage3Pipeline(
                         raise ValueError("Distilled Hunyuan layout is missing guidance_scatter_index.")
                     guidance_position_ids = index[torch.arange(bsz), guidance_index[:, -1]].unsqueeze(-1)
                     position_parts.append(guidance_position_ids)
+                if self.use_meanflow:
+                    timestep_r_index = model_kwargs.get("timesteps_r_scatter_index")
+                    if timestep_r_index is None:
+                        raise ValueError("MeanFlow Hunyuan layout is missing timesteps_r_scatter_index.")
+                    position_parts.append(index[torch.arange(bsz), timestep_r_index[:, -1]].unsqueeze(-1))
                 position_parts.append(position_ids)
                 updated_model_kwargs["position_ids"] = torch.cat(position_parts, dim=1)
 
@@ -1637,6 +1663,10 @@ class HunyuanImage3Pipeline(
                 updated_model_kwargs["gen_timestep_scatter_index"] = model_kwargs["gen_timestep_scatter_index"]
                 if self.cfg_distilled:
                     updated_model_kwargs["guidance_scatter_index"] = model_kwargs["guidance_scatter_index"]
+                if self.use_meanflow:
+                    updated_model_kwargs["timesteps_r_scatter_index"] = model_kwargs[
+                        "timesteps_r_scatter_index"
+                    ]
 
         else:
             if mode == "gen_text":
@@ -1648,6 +1678,10 @@ class HunyuanImage3Pipeline(
                 updated_model_kwargs["gen_timestep_scatter_index"] = model_kwargs["gen_timestep_scatter_index"]
                 if self.cfg_distilled:
                     updated_model_kwargs["guidance_scatter_index"] = model_kwargs["guidance_scatter_index"]
+                if self.use_meanflow:
+                    updated_model_kwargs["timesteps_r_scatter_index"] = model_kwargs[
+                        "timesteps_r_scatter_index"
+                    ]
 
         return updated_model_kwargs
 
@@ -1717,6 +1751,8 @@ class HunyuanImage3Pipeline(
         gen_timestep_scatter_index: torch.Tensor | None = None,
         guidance: torch.Tensor | None = None,
         guidance_scatter_index: torch.Tensor | None = None,
+        timestep_r: torch.Tensor | None = None,
+        timesteps_r_scatter_index: torch.Tensor | None = None,
         # for cond image
         cond_vae_images: BatchRaggedImages | None = None,
         cond_timestep: BatchRaggedTensor | None = None,
@@ -1801,6 +1837,15 @@ class HunyuanImage3Pipeline(
                         guidance_scatter_index.unsqueeze(-1).expand(-1, -1, n_embd),
                         guidance_src,
                     )
+                if self.use_meanflow:
+                    if timestep_r is None or timesteps_r_scatter_index is None:
+                        raise ValueError("MeanFlow Hunyuan forward requires timestep_r and its scatter index.")
+                    timestep_r_src = self.timestep_r_emb(timestep_r.reshape(-1)).reshape(bsz, -1, n_embd)
+                    inputs_embeds.scatter_(
+                        1,
+                        timesteps_r_scatter_index.unsqueeze(-1).expand(-1, -1, n_embd),
+                        timestep_r_src,
+                    )
             else:
                 t_emb = self.time_embed(timestep)
                 image_emb, token_h, token_w = self.patch_embed(images, t_emb)
@@ -1811,6 +1856,10 @@ class HunyuanImage3Pipeline(
                         raise ValueError("Distilled Hunyuan later-step forward requires guidance.")
                     guidance_emb = self.guidance_emb(guidance.reshape(-1)).reshape(bsz, -1, n_embd)
                     parts.append(guidance_emb)
+                if self.use_meanflow:
+                    if timestep_r is None:
+                        raise ValueError("MeanFlow Hunyuan later-step forward requires timestep_r.")
+                    parts.append(self.timestep_r_emb(timestep_r.reshape(-1)).reshape(bsz, -1, n_embd))
                 parts.append(image_emb)
                 inputs_embeds = torch.cat(parts, dim=1)
 
@@ -2000,6 +2049,7 @@ class HunyuanImage3Pipeline(
             image_info.image_token_length
             + (1 if image_info.add_timestep_token else 0)
             + (1 if image_info.add_guidance_token else 0)
+            + (1 if getattr(image_info, "add_timestep_r_token", False) else 0)
         )
         model_kwargs["num_image_tokens"] = num_image_tokens
 
@@ -2230,6 +2280,14 @@ class HunyuanImage3Pipeline(
                 guidance_values,
                 device=latents.device,
                 dtype=torch.bfloat16,
+            )
+        if self.use_meanflow:
+            timestep_r_values = [
+                _get_meanflow_timestep_r(states[state_idx].scheduler, states[state_idx].current_timestep)
+                for state_idx in row_state_indexes
+            ]
+            model_kwargs["timestep_r"] = torch.stack(timestep_r_values).to(
+                device=latents.device, dtype=torch.float32
             )
         if first_step:
             self._restore_injected_ar_kv(states, row_state_indexes, row_branches)

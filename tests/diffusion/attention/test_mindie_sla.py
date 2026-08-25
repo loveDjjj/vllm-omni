@@ -248,9 +248,17 @@ def test_hybrid_supports_lq_not_equal_lk(fake_mindiesd, tmp_path):
     _load_adapter.cache_clear()
     _FakeSLA.calls = []
     impl = _make_impl(_make_adapter(tmp_path))
-    query = torch.randn(1, 3, 4, 64)
+    first_query = torch.randn(1, 5, 4, 64)
     key = torch.randn(1, 5, 1, 64)
     value = torch.randn_like(key)
+    first_mask = torch.ones(1, 1, 5, 5, dtype=torch.bool)
+    impl._hybrid_masked_forward(
+        first_query,
+        key,
+        value,
+        AttentionMetadata(attn_mask=first_mask, full_attn_spans=[[(3, 5)]]),
+    )
+    query = torch.randn(1, 3, 4, 64)
     mask = torch.ones(1, 1, 3, 5, dtype=torch.bool)
     metadata = AttentionMetadata(attn_mask=mask, full_attn_spans=[[(3, 5)]])
 
@@ -258,7 +266,7 @@ def test_hybrid_supports_lq_not_equal_lk(fake_mindiesd, tmp_path):
 
     assert output.shape == query.shape
     torch.testing.assert_close(output[:, 1:], query[:, 1:])
-    assert _FakeSLA.last_shapes == ((1, 4, 2, 64), (1, 4, 5, 64), (1, 4, 5, 64))
+    assert _FakeSLA.last_shapes == ((1, 4, 5, 64), (1, 4, 5, 64), (1, 4, 5, 64))
 
 
 def test_module_forward_dispatches_to_npu_implementation(fake_mindiesd, tmp_path):

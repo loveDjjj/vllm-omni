@@ -321,6 +321,7 @@ class MindIESLAImpl(nn.Module, AttentionImpl):
             persistent=False,
         )
         self._adapter_installed = False
+        self._query_prefix_cache: list[torch.Tensor] | None = None
 
     def get_externally_loaded_parameter_names(self, prefix: str) -> set[str]:
         """Return parameters supplied by the validated SLA artifact."""
@@ -393,8 +394,29 @@ class MindIESLAImpl(nn.Module, AttentionImpl):
                 "MINDIE_SLA hybrid mode requires KV length >= query length; "
                 f"got Lq={query.shape[1]}, Lk={key.shape[1]}."
             )
+        if query_offset == 0:
+            self._query_prefix_cache = [
+                query[index:index + 1, : min((start for start, _ in spans), default=0)].detach()
+                for index, spans in enumerate(spans_by_batch)
+            ]
+        elif self._query_prefix_cache is None or len(self._query_prefix_cache) != query.shape[0]:
+            raise RuntimeError("MINDIE_SLA subsequent denoise step is missing its first-step query prefix cache.")
+
         rows = []
         for batch_index, spans in enumerate(spans_by_batch):
+            if query_offset:
+                cached_prefix = self._query_prefix_cache[batch_index]
+                if cached_prefix.shape[1] != query_offset:
+                    raise RuntimeError(
+                        "MINDIE_SLA query prefix cache length mismatch: "
+                        f"cached={cached_prefix.shape[1]}, expected={query_offset}."
+                    )
+                aligned_query = torch.cat(
+                    [cached_prefix.to(device=query.device, dtype=query.dtype), query[batch_index:batch_index + 1]],
+                    dim=1,
+                )
+            else:
+                aligned_query = query[batch_index:batch_index + 1]
             segments = build_segments(spans, query_offset, query_len)
             row_outputs = []
             for segment in segments:
@@ -407,11 +429,12 @@ class MindIESLAImpl(nn.Module, AttentionImpl):
                             "MINDIE_SLA full-attention span exceeds the KV length: "
                             f"batch={batch_index}, span={segment}, kv_len={key.shape[1]}."
                         )
-                    row_output = self._run_sla(
-                        row_query,
+                    prefix_output = self._run_sla(
+                        aligned_query[:, : segment.kv_end],
                         key[batch_index : batch_index + 1, : segment.kv_end],
                         value[batch_index : batch_index + 1, : segment.kv_end],
                     )
+                    row_output = prefix_output[:, segment.q_start : segment.q_end]
                 else:
                     row_metadata = AttentionMetadata(
                         attn_mask=attn_metadata.attn_mask[

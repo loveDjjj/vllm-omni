@@ -27,7 +27,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 def _pipeline():
     pipeline = object.__new__(HunyuanImage3Pipeline)
-    pipeline.hf_config = SimpleNamespace(cfg_distilled=False)
+    pipeline.hf_config = SimpleNamespace(cfg_distilled=False, use_meanflow=False)
     pipeline._tkwrapper = SimpleNamespace(pad_token_id=0)
     pipeline.od_config = SimpleNamespace(
         diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="TORCH_SDPA")),
@@ -323,10 +323,52 @@ def test_distilled_later_step_injects_guidance_without_cfg_batch(monkeypatch):
     torch.testing.assert_close(output, torch.ones(1, 1))
 
 
-@pytest.mark.parametrize(("cfg_distilled", "special_tokens"), [(False, 1), (True, 2)])
-def test_ragged_final_layer_removes_checkpoint_specific_special_tokens(cfg_distilled, special_tokens):
+def test_meanflow_later_step_injects_scheduler_timestep_r(monkeypatch):
+    pipeline = _pipeline()
+    pipeline.hf_config.cfg_distilled = True
+    pipeline.hf_config.use_meanflow = True
+    monkeypatch.setattr(HunyuanImage3Pipeline, "device", property(lambda self: torch.device("cpu")))
+    state = _state("meanflow", 1)
+    state.scheduler = SimpleNamespace(get_timestep_r=lambda timestep: timestep - 0.125)
+    state.extra[_STEP_MODEL_KWARGS].update(
+        {
+            "attention_mask": torch.ones(1, 1, 2, 5, dtype=torch.bool),
+            "full_attn_spans": [[(3, 5)]],
+        }
+    )
+    state.extra[_STEP_PROMPT_KV] = [
+        {
+            "key": torch.zeros(1, 3, 1, 1),
+            "value": torch.zeros(1, 3, 1, 1),
+            "lens": torch.tensor([3]),
+        }
+    ]
+    captured = {}
+    pipeline._restore_prompt_kv_cache = lambda *_args: None
+
+    def fake_prepare_inputs(input_ids, images, timestep, **model_kwargs):
+        captured.update(model_kwargs)
+        return {}
+
+    pipeline.prepare_inputs_for_generation = fake_prepare_inputs
+    pipeline.forward_call = lambda **_kwargs: {"diffusion_prediction": torch.ones(1, 1)}
+    pipeline._update_model_kwargs_for_generation = lambda _output, model_kwargs: model_kwargs
+
+    pipeline._denoise_step_group([state])
+
+    torch.testing.assert_close(captured["timestep_r"], torch.tensor([state.current_timestep - 0.125]))
+
+
+@pytest.mark.parametrize(
+    ("cfg_distilled", "use_meanflow", "special_tokens"),
+    [(False, False, 1), (True, False, 2), (True, True, 3)],
+)
+def test_ragged_final_layer_removes_checkpoint_specific_special_tokens(
+    cfg_distilled, use_meanflow, special_tokens
+):
     pipeline = _pipeline()
     pipeline.hf_config.cfg_distilled = cfg_distilled
+    pipeline.hf_config.use_meanflow = use_meanflow
     captured: dict[str, torch.Tensor] = {}
     pipeline.time_embed_2 = lambda timestep: timestep
 
