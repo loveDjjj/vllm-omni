@@ -1,6 +1,5 @@
-# HunyuanImage-3.0-Instruct-Distil + MindIE-SD SLA, Ascend NPU TP8.
-# Legacy BLKQ64 profile. Use this for existing proj-only adapters trained with BLKQ=64.
-# QKV/O delta adapters use hunyuan_image_3_distil_sla_qkvo.yaml instead.
+# HunyuanImage-3.0-Instruct-Distil + QKV/O-delta SLA, Ascend NPU TP8.
+# Set HUNYUAN_SLA_ADAPTER to the exported v2 adapter directory before launch.
 pipeline: hunyuan_image_3_moe
 async_chunk: false
 trust_remote_code: true
@@ -52,7 +51,7 @@ stages:
           mindie_sla:
             adapter_path: ${oc.env:HUNYUAN_SLA_ADAPTER}
             topk: 0.125
-            blkq: 64
+            blkq: 128
             blkk: 128
             use_bf16: true
             mask_policy: hybrid
