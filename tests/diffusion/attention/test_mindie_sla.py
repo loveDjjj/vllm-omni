@@ -183,6 +183,8 @@ def test_v2_attention_deltas_are_added_before_tp_loading(tmp_path):
         ("model.layers.0.self_attn.qkv_proj.weight", torch.zeros(8, 4)),
         ("model.layers.0.self_attn.o_proj.weight", torch.ones(4, 4)),
         ("model.layers.0.input_layernorm.weight", torch.ones(4)),
+        ("vision_model.encoder.layers.0.self_attn.k_proj.weight", torch.full((6, 6), 7.0)),
+        ("vision_model.encoder.layers.0.self_attn.o_proj.weight", torch.full((6, 6), 8.0)),
     ]
 
     loaded = dict(apply_attention_deltas(iter(base_weights), str(adapter)))
@@ -196,6 +198,14 @@ def test_v2_attention_deltas_are_added_before_tp_loading(tmp_path):
         torch.ones(4, 4) + tensors["layers.0.o_delta.weight"],
     )
     torch.testing.assert_close(loaded["model.layers.0.input_layernorm.weight"], torch.ones(4))
+    torch.testing.assert_close(
+        loaded["vision_model.encoder.layers.0.self_attn.k_proj.weight"],
+        torch.full((6, 6), 7.0),
+    )
+    torch.testing.assert_close(
+        loaded["vision_model.encoder.layers.0.self_attn.o_proj.weight"],
+        torch.full((6, 6), 8.0),
+    )
 
 
 def test_v2_packed_qkv_delta_supports_split_checkpoints(tmp_path):

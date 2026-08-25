@@ -33,7 +33,7 @@ _SUPPORTED_FORMAT_VERSIONS = frozenset({1, 2})
 _ARCHITECTURE = "HunyuanImage3SparseLinearAttentionAdapter"
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 _ATTENTION_WEIGHT_RE = re.compile(
-    r"(?:^|\.)layers\.(\d+)\.(?:module\.)?self_attn\."
+    r"^model\.layers\.(\d+)\.(?:module\.)?self_attn\."
     r"(qkv_proj|q_proj|k_proj|v_proj|o_proj)\.weight$"
 )
 _VALID_MASK_POLICIES = frozenset({"hybrid", "error", "dense_fallback"})
