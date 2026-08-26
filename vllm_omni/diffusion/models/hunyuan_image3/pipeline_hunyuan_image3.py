@@ -1689,6 +1689,7 @@ class HunyuanImage3Pipeline(
     def _generate(
         self,
         generator: list[torch.Generator] | None = None,
+        return_teacher_trajectory: bool = False,
         **kwargs,
     ):
         mode = kwargs.get("mode", "gen_text")
@@ -1706,6 +1707,7 @@ class HunyuanImage3Pipeline(
                 image_info.image_token_length
                 + (1 if image_info.add_timestep_token else 0)
                 + (1 if image_info.add_guidance_token else 0)
+                + (1 if image_info.add_timestep_r_token else 0)
             )
             kwargs["num_image_tokens"] = num_image_tokens
             # 50 and 5.0 hard code
@@ -1719,9 +1721,10 @@ class HunyuanImage3Pipeline(
                 guidance_scale=kwargs.get("guidance_scale", 5.0),
                 generator=generator,
                 model_kwargs=kwargs,
+                return_teacher_trajectory=return_teacher_trajectory,
             )
             samples = results[0]
-            return samples
+            return (samples, results.teacher_trajectory) if return_teacher_trajectory else samples
 
         else:
             raise ValueError(f"Unknown mode {mode}, only `gen_text` and `gen_image` are supported.")
@@ -2557,7 +2560,43 @@ class HunyuanImage3Pipeline(
 
         model_inputs.update(ar_kv_kwargs)
 
-        outputs = self._generate(**model_inputs, **kwargs)
+        return_teacher_trajectory = bool(
+            getattr(req.sampling_params, "return_teacher_trajectory", False)
+            or kwargs.pop("return_teacher_trajectory", False)
+        )
+        outputs = self._generate(
+            **model_inputs,
+            return_teacher_trajectory=return_teacher_trajectory,
+            **kwargs,
+        )
+        if return_teacher_trajectory:
+            _, trajectory = outputs
+            if not isinstance(trajectory, dict):
+                raise RuntimeError("Hunyuan Dense teacher trajectory was requested but not produced.")
+            prompt_item = req.prompts[0] if req.prompts and isinstance(req.prompts[0], dict) else {}
+            prompt_extra = prompt_item.get("extra", {}) if isinstance(prompt_item, dict) else {}
+            image_info: ImageInfo = model_inputs["batch_gen_image_info"][0]
+            trajectory["metadata"].update(
+                {
+                    "prompt": prompt[0],
+                    "cot_text": cot_text_list[0] or "",
+                    "system_prompt": system_prompt or "",
+                    "height": int(image_info.image_height),
+                    "width": int(image_info.image_width),
+                    "token_height": int(image_info.token_height),
+                    "token_width": int(image_info.token_width),
+                    "full_attention_spans": trajectory["metadata"].get("full_attention_spans") or [],
+                    "ar_generated_token_ids": prompt_extra.get("ar_generated_token_ids") or [],
+                    "ar_prompt_token_ids": prompt_extra.get("ar_prompt_token_ids") or [],
+                    "sample_id": prompt_extra.get("sample_id") or prompt_item.get("sample_id"),
+                    "guidance_scale": float(guidance_scale),
+                }
+            )
+            return DiffusionOutput(
+                output={"payload": {"trajectory": trajectory}},
+                stage_durations=getattr(self, "stage_durations", None),
+                to_cpu=True,
+            )
         image = outputs[0]
         metadata = {}
         if any(t is not None for t in cot_text_list):

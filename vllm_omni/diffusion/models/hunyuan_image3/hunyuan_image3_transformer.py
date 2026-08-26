@@ -2574,6 +2574,7 @@ class ClassifierFreeGuidance:
 @dataclass
 class HunyuanImage3Text2ImagePipelineOutput(BaseOutput):
     samples: list[Any] | np.ndarray
+    teacher_trajectory: dict[str, Any] | None = None
 
 
 class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
@@ -3003,6 +3004,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         | None = None,
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         model_kwargs: dict[str, Any] | None = None,
+        return_teacher_trajectory: bool = False,
         **kwargs,
     ):
         r"""
@@ -3138,6 +3140,42 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         if use_meanflow and model_kwargs.get("timesteps_r_scatter_index") is None:
             raise ValueError("MeanFlow Hunyuan layout is missing timesteps_r_scatter_index before denoising.")
 
+        teacher_trajectory = None
+        if return_teacher_trajectory:
+            if not cfg_distilled or not use_meanflow or batch_size != 1:
+                raise ValueError("Teacher trajectory capture requires one distilled MeanFlow sample.")
+
+            def clone_condition(name: str) -> torch.Tensor:
+                value = model_kwargs.get(name)
+                if not isinstance(value, torch.Tensor):
+                    raise ValueError(f"Teacher trajectory condition is missing tensor {name!r}.")
+                return value.detach().clone()
+
+            timestep_index = clone_condition("gen_timestep_scatter_index")
+            teacher_trajectory = {
+                "latents": [latents[0].detach().float().clone()],
+                "predictions": [],
+                "timesteps": [],
+                "timesteps_r": [],
+                "condition": {
+                    "input_ids": input_ids.detach().clone(),
+                    "position_ids": clone_condition("position_ids"),
+                    "image_mask": clone_condition("image_mask"),
+                    "attention_mask": clone_condition("attention_mask"),
+                    "timesteps_index": timestep_index,
+                    "guidance_index": clone_condition("guidance_scatter_index"),
+                    "timesteps_r_index": clone_condition("timesteps_r_scatter_index"),
+                    "gen_timestep_scatter_index": timestep_index.detach().clone(),
+                    "guidance": torch.tensor(
+                        [1000.0 * self._guidance_scale], device=device, dtype=torch.bfloat16
+                    ),
+                },
+                "metadata": {
+                    "scheduler_latent_dtype": "float32",
+                    "full_attention_spans": model_kwargs.get("full_attn_spans") or [],
+                },
+            }
+
         # Attempt to reuse KV cache from the AR stage.
         # Note: the reusable KV length may differ between positive and negative prompts.
         input_ids, ar_kv_reuse_len = self._maybe_handle_ar_kv_reuse(
@@ -3230,8 +3268,15 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     pred_cond, pred_uncond = pred.chunk(2)
                     pred = self.cfg_operator(pred_cond, pred_uncond, self.guidance_scale, step=i)
 
+                if teacher_trajectory is not None:
+                    teacher_trajectory["predictions"].append(pred[0].detach().float().clone())
+                    teacher_trajectory["timesteps"].append(t.detach().float().clone())
+                    teacher_trajectory["timesteps_r"].append(timestep_r.detach().float().clone())
+
                 # Scheduler step (all ranks compute locally in CFG parallel)
                 latents = self.scheduler.step(pred, t, latents, **_scheduler_step_extra_kwargs, return_dict=False)[0]
+                if teacher_trajectory is not None:
+                    teacher_trajectory["latents"].append(latents[0].detach().float().clone())
                 if i != len(timesteps) - 1 and should_compute:
                     model_kwargs = self.model._update_model_kwargs_for_generation(  # noqa
                         model_output,
@@ -3260,6 +3305,19 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     progress_bar.update()
 
         set_forward_context_denoise_step_idx(None)
+
+        if teacher_trajectory is not None:
+            return HunyuanImage3Text2ImagePipelineOutput(
+                samples=latents,
+                teacher_trajectory={
+                    "latents": torch.stack(teacher_trajectory["latents"]),
+                    "predictions": torch.stack(teacher_trajectory["predictions"]),
+                    "timesteps": torch.stack(teacher_trajectory["timesteps"]).reshape(-1),
+                    "timesteps_r": torch.stack(teacher_trajectory["timesteps_r"]).reshape(-1),
+                    "condition": teacher_trajectory["condition"],
+                    "metadata": teacher_trajectory["metadata"],
+                },
+            )
 
         if hasattr(self.vae.config, "scaling_factor") and self.vae.config.scaling_factor:
             latents = latents / self.vae.config.scaling_factor
