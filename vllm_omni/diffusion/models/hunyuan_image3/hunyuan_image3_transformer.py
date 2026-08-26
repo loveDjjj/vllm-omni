@@ -1190,11 +1190,18 @@ class ImageKVCacheManager(nn.Module):
         attention_mask = attention_mask.contiguous()
 
         full_attn_spans = kwargs.get("full_attn_spans", None)
+        sla_static_prefix_lens = kwargs.get("sla_static_prefix_lens", None)
+        metadata_extra = (
+            {"sla_static_prefix_lens": sla_static_prefix_lens}
+            if sla_static_prefix_lens is not None
+            else {}
+        )
 
         if self.sp_size <= 1:
             attn_metadata = AttentionMetadata(
                 attn_mask=attention_mask,
                 full_attn_spans=full_attn_spans,
+                extra=metadata_extra,
             )
         else:
             attn_metadata = AttentionMetadata(
@@ -1204,6 +1211,7 @@ class ImageKVCacheManager(nn.Module):
                 joint_strategy="front",
                 attn_mask=attention_mask,
                 full_attn_spans=full_attn_spans,
+                extra=metadata_extra,
             )
         attn_output = self.attn(query, key, value, attn_metadata)
         attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
@@ -2412,6 +2420,7 @@ class HunyuanImage3Model(nn.Module):
         uncond_cfg_prefill: bool = False,
         ar_kv_reuse_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
+        sla_static_prefix_lens: list[int] | None = None,
     ) -> tuple | BaseModelOutputWithPast:
         current_omni_platform.reset_diffusion_fused_moe_forward_context()
 
@@ -2520,6 +2529,7 @@ class HunyuanImage3Model(nn.Module):
                 shard_padding_size=shard_padding_size,
                 uncond_cfg_prefill=uncond_cfg_prefill,
                 full_attn_spans=full_attn_spans,
+                sla_static_prefix_lens=sla_static_prefix_lens,
             )
 
             hidden_states = layer_outputs[0]
@@ -2764,6 +2774,8 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         # List[List[...]] per-sample metadata indexed along the CFG batch dim
         if isinstance(model_kwargs.get("full_attn_spans"), list):
             model_kwargs["full_attn_spans"] = model_kwargs["full_attn_spans"][s.start : s.stop]
+        if isinstance(model_kwargs.get("sla_static_prefix_lens"), list):
+            model_kwargs["sla_static_prefix_lens"] = model_kwargs["sla_static_prefix_lens"][s.start : s.stop]
 
         # custom_pos_emb: tuple of (cos, sin)
         if "custom_pos_emb" in model_kwargs and model_kwargs["custom_pos_emb"] is not None:

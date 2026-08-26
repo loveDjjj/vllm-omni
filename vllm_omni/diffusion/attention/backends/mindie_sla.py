@@ -395,10 +395,26 @@ class MindIESLAImpl(nn.Module, AttentionImpl):
                 f"got Lq={query.shape[1]}, Lk={key.shape[1]}."
             )
         if query_offset == 0:
-            self._query_prefix_cache = [
-                query[index:index + 1, : min((start for start, _ in spans), default=0)].detach()
-                for index, spans in enumerate(spans_by_batch)
-            ]
+            static_prefix_lens = attn_metadata.extra.get("sla_static_prefix_lens")
+            if static_prefix_lens is not None and len(static_prefix_lens) != query.shape[0]:
+                raise ValueError(
+                    "MINDIE_SLA static prefix metadata must have one length per batch row; "
+                    f"got {len(static_prefix_lens)} for batch={query.shape[0]}."
+                )
+            self._query_prefix_cache = []
+            for index, spans in enumerate(spans_by_batch):
+                image_start = min((start for start, _ in spans), default=0)
+                prefix_len = (
+                    int(static_prefix_lens[index])
+                    if static_prefix_lens is not None
+                    else image_start
+                )
+                if prefix_len < 0 or prefix_len > image_start:
+                    raise ValueError(
+                        "MINDIE_SLA static prefix must end before the first full-attention image span: "
+                        f"batch={index}, prefix_len={prefix_len}, image_start={image_start}."
+                    )
+                self._query_prefix_cache.append(query[index:index + 1, :prefix_len].detach())
         elif self._query_prefix_cache is None or len(self._query_prefix_cache) != query.shape[0]:
             raise RuntimeError("MINDIE_SLA subsequent denoise step is missing its first-step query prefix cache.")
 

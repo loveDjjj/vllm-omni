@@ -1472,6 +1472,9 @@ class HunyuanImage3Pipeline(
             guidance_scale=guidance_scale,
             image_mask=to_device(output.gen_image_mask, device),
             gen_timestep_scatter_index=output.gen_timestep_scatter_index,
+            sla_static_prefix_lens=[
+                int(value) for value in output.gen_timestep_scatter_index[:, -1].tolist()
+            ] if output.gen_timestep_scatter_index is not None else None,
             guidance_scatter_index=to_device(output.guidance_scatter_index, device),
             timesteps_r_scatter_index=to_device(output.gen_timestep_r_scatter_index, device),
             cond_vae_images=to_device(cond_vae_images, device),
@@ -1558,6 +1561,7 @@ class HunyuanImage3Pipeline(
                 "image_mask": kwargs.get("image_mask"),
                 "timestep": kwargs.get("timestep"),
                 "gen_timestep_scatter_index": kwargs.get("gen_timestep_scatter_index"),
+                "sla_static_prefix_lens": kwargs.get("sla_static_prefix_lens"),
                 "guidance": kwargs.get("guidance"),
                 "guidance_scatter_index": kwargs.get("guidance_scatter_index"),
                 "timestep_r": kwargs.get("timestep_r"),
@@ -1598,6 +1602,8 @@ class HunyuanImage3Pipeline(
             updated_model_kwargs["timesteps_r_scatter_index"] = model_kwargs["timesteps_r_scatter_index"]
         if "full_attn_spans" in model_kwargs:
             updated_model_kwargs["full_attn_spans"] = model_kwargs["full_attn_spans"]
+        if "sla_static_prefix_lens" in model_kwargs:
+            updated_model_kwargs["sla_static_prefix_lens"] = model_kwargs["sla_static_prefix_lens"]
 
         # update past_key_values keeping its naming used in model code
         for possible_cache_name in ALL_CACHE_NAMES:
@@ -1777,6 +1783,7 @@ class HunyuanImage3Pipeline(
         uncond_cfg_prefill: bool = False,
         ar_kv_reuse_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
+        sla_static_prefix_lens: list[int] | None = None,
     ) -> tuple | CausalMMOutputWithPast:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         # Sanity Check of Inputs
@@ -1911,6 +1918,7 @@ class HunyuanImage3Pipeline(
                 uncond_cfg_prefill=uncond_cfg_prefill,
                 ar_kv_reuse_len=ar_kv_reuse_len,
                 full_attn_spans=full_attn_spans,
+                sla_static_prefix_lens=sla_static_prefix_lens,
             )
         hidden_states = outputs[0]
 

@@ -256,7 +256,11 @@ def test_hybrid_supports_lq_not_equal_lk(fake_mindiesd, tmp_path):
         first_query,
         key,
         value,
-        AttentionMetadata(attn_mask=first_mask, full_attn_spans=[[(3, 5)]]),
+        AttentionMetadata(
+            attn_mask=first_mask,
+            full_attn_spans=[[(3, 5)]],
+            extra={"sla_static_prefix_lens": [2]},
+        ),
     )
     query = torch.randn(1, 3, 4, 64)
     mask = torch.ones(1, 1, 3, 5, dtype=torch.bool)
@@ -267,6 +271,31 @@ def test_hybrid_supports_lq_not_equal_lk(fake_mindiesd, tmp_path):
     assert output.shape == query.shape
     torch.testing.assert_close(output[:, 1:], query[:, 1:])
     assert _FakeSLA.last_shapes == ((1, 4, 5, 64), (1, 4, 5, 64), (1, 4, 5, 64))
+
+
+def test_hybrid_query_prefix_excludes_three_dynamic_special_tokens(fake_mindiesd, tmp_path):
+    _load_adapter.cache_clear()
+    impl = _make_impl(_make_adapter(tmp_path))
+    first_query = torch.randn(1, 8, 4, 64)
+    first_key = torch.randn(1, 8, 1, 64)
+    first_value = torch.randn_like(first_key)
+    first_metadata = AttentionMetadata(
+        attn_mask=torch.ones(1, 1, 8, 8, dtype=torch.bool),
+        full_attn_spans=[[(5, 8)]],
+        extra={"sla_static_prefix_lens": [2]},
+    )
+    impl._hybrid_masked_forward(first_query, first_key, first_value, first_metadata)
+
+    query = torch.randn(1, 6, 4, 64)
+    metadata = AttentionMetadata(
+        attn_mask=torch.ones(1, 1, 6, 8, dtype=torch.bool),
+        full_attn_spans=[[(5, 8)]],
+        extra={"sla_static_prefix_lens": [2]},
+    )
+    output = impl._hybrid_masked_forward(query, first_key, first_value, metadata)
+
+    assert impl._query_prefix_cache[0].shape[1] == 2
+    assert output.shape == query.shape
 
 
 def test_module_forward_dispatches_to_npu_implementation(fake_mindiesd, tmp_path):
