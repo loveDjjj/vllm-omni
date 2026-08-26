@@ -275,7 +275,7 @@ def test_step_scheduler_records_dense_teacher_trajectory():
         "timesteps_r": [],
         "scheduler_dts": [],
         "condition": {"input_ids": torch.ones(1, 3, dtype=torch.long)},
-        "metadata": {"prompt": "test"},
+        "metadata": {"prompt": "test", "scheduler_latent_dtype": "bfloat16"},
     }
 
     prediction = torch.ones_like(state.latents, dtype=torch.float32)
@@ -289,6 +289,7 @@ def test_step_scheduler_records_dense_teacher_trajectory():
     torch.testing.assert_close(trajectory["timesteps_r"], torch.tensor([0.75]))
     torch.testing.assert_close(trajectory["scheduler_dts"], torch.tensor([-0.25]))
     assert result.to_cpu is True
+    assert trajectory["metadata"]["scheduler_latent_dtype"] == "bfloat16"
 
 
 def test_later_step_merge_shifts_spans_without_polluting_request_state():

@@ -2144,6 +2144,7 @@ class HunyuanImage3Pipeline(
                     ),
                 },
                 "metadata": {
+                    "scheduler_latent_dtype": "bfloat16",
                     "prompt": prompt[0],
                     "cot_text": cot_text_list[0] or "",
                     "system_prompt": system_prompt or "",
