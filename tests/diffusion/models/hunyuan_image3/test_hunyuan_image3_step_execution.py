@@ -16,6 +16,7 @@ from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
     _STEP_INPUT_IDS,
     _STEP_MODEL_KWARGS,
     _STEP_PROMPT_KV,
+    _STEP_TEACHER_TRAJECTORY,
     HunyuanImage3Pipeline,
 )
 from vllm_omni.diffusion.worker.input_batch import InputBatch
@@ -219,6 +220,45 @@ def test_step_scheduler_preserves_latent_dtype_for_mixed_progress_batches():
 
     assert state.latents.dtype == torch.bfloat16
     assert state.step_index == 1
+
+
+def test_step_scheduler_records_dense_teacher_trajectory():
+    pipeline = _pipeline()
+    pipeline.hf_config.use_meanflow = True
+    pipeline._pipeline = SimpleNamespace(prepare_extra_func_kwargs=lambda step, kwargs: {})
+
+    class FakeScheduler:
+        def get_timestep_r(self, timestep):
+            return timestep - 0.25
+
+        def step(self, noise_pred, timestep, latents, **kwargs):
+            del timestep, kwargs
+            return (latents.float() + noise_pred.float(),)
+
+    state = _state("teacher", 0)
+    state.timesteps = torch.tensor([1.0])
+    state.scheduler = FakeScheduler()
+    state.latents = torch.zeros(1, 4, 8, 8, dtype=torch.bfloat16)
+    state.extra[_STEP_GENERATOR] = None
+    state.extra[_STEP_TEACHER_TRAJECTORY] = {
+        "latents": [state.latents[0].float().clone()],
+        "predictions": [],
+        "timesteps": [],
+        "timesteps_r": [],
+        "condition": {"input_ids": torch.ones(1, 3, dtype=torch.long)},
+        "metadata": {"prompt": "test"},
+    }
+
+    prediction = torch.ones_like(state.latents, dtype=torch.float32)
+    pipeline.step_scheduler(state, prediction)
+    result = pipeline.post_decode(state)
+    trajectory = result.output["payload"]["trajectory"]
+
+    assert trajectory["latents"].shape == (2, 4, 8, 8)
+    assert trajectory["predictions"].shape == (1, 4, 8, 8)
+    torch.testing.assert_close(trajectory["timesteps"], torch.tensor([1.0]))
+    torch.testing.assert_close(trajectory["timesteps_r"], torch.tensor([0.75]))
+    assert result.to_cpu is True
 
 
 def test_later_step_merge_shifts_spans_without_polluting_request_state():

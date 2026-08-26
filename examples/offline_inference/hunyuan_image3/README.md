@@ -10,6 +10,14 @@ YAMLs under `vllm_omni/deploy/`.
 | `vllm_omni/deploy/hunyuan_image3.yaml` | AR + DiT | Default for `text2img` and `img2img`. |
 | `vllm_omni/deploy/hunyuan_image3_ar.yaml` | AR only | Default for `img2text` and `text2text`. |
 | `vllm_omni/deploy/hunyuan_image3_dit.yaml` | DiT only | Standalone diffusion stage. Pass it explicitly with `--deploy-config`. |
+| `vllm_omni/deploy/hunyuan_image_3_distil_ar_capture.yaml` | Distil AR TP8 | Offline SLA condition capture. |
+| `vllm_omni/deploy/hunyuan_image_3_distil_dit_trajectory.yaml` | Dense Distil DiT TP8+EP | Offline SLA teacher trajectory capture. |
+| `vllm_omni/deploy/hunyuan_image_3_distil_trajectory_16npu.yaml` | Distil AR TP8 + Dense DiT TP8+EP | End-to-end 16-NPU trajectory capture. |
+
+The trajectory deploys are consumed by the companion HunyuanImage3-SLA
+offline collector. They force the Dense `TORCH_SDPA` teacher, 8-step MeanFlow,
+and expose `x_t`, `t`, `t_r`, the Dense prediction, and the complete diffusion
+condition. They must not be used with an SLA adapter or diffusion cache.
 
 The example chooses a deploy config automatically when `--deploy-config` and
 `--stage-configs-path` are both omitted:

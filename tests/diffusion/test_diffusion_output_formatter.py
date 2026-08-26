@@ -162,6 +162,9 @@ def test_formatter_maps_trajectory_payload_to_request_output(
     latents = torch.zeros(2, 1, 4)
     timesteps = torch.tensor([1.0, 0.5])
     log_probs = torch.tensor([-0.1, -0.2])
+    predictions = torch.ones(2, 1, 4)
+    timesteps_r = torch.tensor([0.5, 0.0])
+    condition = {"input_ids": torch.ones(1, 3, dtype=torch.long)}
     postprocess_output = normalize_diffusion_postprocess_output(
         {
             "payload": {
@@ -170,6 +173,9 @@ def test_formatter_maps_trajectory_payload_to_request_output(
                     "latents": latents,
                     "timesteps": timesteps,
                     "log_probs": log_probs,
+                    "predictions": predictions,
+                    "timesteps_r": timesteps_r,
+                    "condition": condition,
                 },
             },
             "metadata": {"trajectory": {"type": "denoising"}},
@@ -195,6 +201,9 @@ def test_formatter_maps_trajectory_payload_to_request_output(
             "latents": latents,
             "timesteps": timesteps,
             "log_probs": log_probs,
+            "predictions": predictions,
+            "timesteps_r": timesteps_r,
+            "condition": condition,
         },
     }
 

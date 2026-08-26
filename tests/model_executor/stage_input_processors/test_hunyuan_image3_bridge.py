@@ -21,6 +21,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 def _source_output(token_ids: list[int], text: str = ""):
     return SimpleNamespace(
+        prompt_token_ids=[10, 11],
         outputs=[
             SimpleNamespace(
                 token_ids=token_ids,
@@ -66,6 +67,8 @@ def test_ar2diffusion_uses_parent_output_when_companions_are_present():
 
     assert result is not None
     assert result["extra"]["ar_generated_text"] == "parent thought"
+    assert result["extra"]["ar_generated_token_ids"] == [100]
+    assert result["extra"]["ar_prompt_token_ids"] == [10, 11]
 
 
 def test_ar2diffusion_returns_none_without_parent_output():

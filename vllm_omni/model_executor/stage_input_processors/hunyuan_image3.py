@@ -187,6 +187,11 @@ def ar2diffusion(
         "width": width,
         "extra": {
             "ar_generated_text": cot_text_for_dit,
+            "ar_generated_token_ids": [int(token_id) for token_id in generated_token_ids],
+            "ar_prompt_token_ids": [
+                int(token_id) for token_id in (getattr(ar_output, "prompt_token_ids", None) or [])
+            ],
+            "sample_id": original_prompt.get("sample_id"),
         },
     }
 

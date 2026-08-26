@@ -357,6 +357,10 @@ def _trajectory_payload(
             ("timesteps", "timesteps"),
             ("log_probs", "log_probs"),
             ("decoded", "decoded"),
+            ("predictions", "predictions"),
+            ("timesteps_r", "timesteps_r"),
+            ("condition", "condition"),
+            ("metadata", "metadata"),
         ):
             value = payload.get(source_key)
             if value is not None:

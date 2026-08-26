@@ -70,6 +70,7 @@ _STEP_OUTPUT_SIZE = "hunyuan_output_size"
 _STEP_COT_TEXT_LIST = "hunyuan_cot_text_list"
 _STEP_AR_KV = "hunyuan_ar_kv"
 _STEP_PROMPT_KV = "hunyuan_prompt_kv"
+_STEP_TEACHER_TRAJECTORY = "hunyuan_teacher_trajectory"
 
 _HUNYUAN_DEFAULT_OUTPUT_TYPE = "pil"
 
@@ -2096,6 +2097,58 @@ class HunyuanImage3Pipeline(
         )
         model_kwargs["ar_kv_reuse_len"] = ar_kv_reuse_len
 
+        teacher_trajectory = None
+        if getattr(sampling, "return_teacher_trajectory", False):
+            if not self.cfg_distilled or not self.use_meanflow:
+                raise ValueError("Teacher trajectory capture requires a distilled MeanFlow checkpoint.")
+            if int(ar_kv_reuse_len or 0) != 0:
+                raise ValueError("Teacher trajectory capture requires full condition tokens, not AR KV reuse.")
+            if input_ids is None or input_ids.shape[0] != 1 or latents.shape[0] != 1:
+                raise ValueError("Teacher trajectory capture currently requires one T2I sample per request.")
+
+            def clone_tensor(name: str) -> torch.Tensor:
+                value = model_kwargs.get(name)
+                if not isinstance(value, torch.Tensor):
+                    raise ValueError(f"Teacher trajectory condition is missing tensor {name!r}.")
+                return value.detach().clone()
+
+            prompt_item = state.prompt if isinstance(state.prompt, dict) else {}
+            prompt_extra = prompt_item.get("extra", {}) if isinstance(prompt_item, dict) else {}
+            timestep_index = clone_tensor("gen_timestep_scatter_index")
+            teacher_trajectory = {
+                "latents": [latents[0].detach().float().clone()],
+                "predictions": [],
+                "timesteps": [],
+                "timesteps_r": [],
+                "condition": {
+                    "input_ids": input_ids.detach().clone(),
+                    "position_ids": clone_tensor("position_ids"),
+                    "image_mask": clone_tensor("image_mask"),
+                    "attention_mask": clone_tensor("attention_mask"),
+                    "timesteps_index": timestep_index,
+                    "guidance_index": clone_tensor("guidance_scatter_index"),
+                    "timesteps_r_index": clone_tensor("timesteps_r_scatter_index"),
+                    "gen_timestep_scatter_index": timestep_index.detach().clone(),
+                    "guidance": torch.tensor(
+                        [1000.0 * guidance_scale], device=latents.device, dtype=torch.bfloat16
+                    ),
+                },
+                "metadata": {
+                    "prompt": prompt[0],
+                    "cot_text": cot_text_list[0] or "",
+                    "system_prompt": system_prompt or "",
+                    "height": target_height,
+                    "width": target_width,
+                    "token_height": int(image_info.token_height),
+                    "token_width": int(image_info.token_width),
+                    "full_attention_spans": model_kwargs.get("full_attn_spans") or [],
+                    "ar_generated_token_ids": prompt_extra.get("ar_generated_token_ids") or [],
+                    "ar_prompt_token_ids": prompt_extra.get("ar_prompt_token_ids") or [],
+                    "sample_id": prompt_extra.get("sample_id") or prompt_item.get("sample_id"),
+                    "guidance_scale": float(guidance_scale),
+                },
+            }
+
         state.latents = latents
         state.timesteps = timesteps
         state.step_index = 0
@@ -2110,6 +2163,7 @@ class HunyuanImage3Pipeline(
             _STEP_OUTPUT_SIZE: (target_height, target_width),
             _STEP_COT_TEXT_LIST: cot_text_list,
             _STEP_AR_KV: self._snapshot_injected_ar_kv(),
+            _STEP_TEACHER_TRAJECTORY: teacher_trajectory,
         }
         return state
 
@@ -2362,6 +2416,13 @@ class HunyuanImage3Pipeline(
         if getattr(self, "interrupt", False):
             return
         generator = state.extra.get(_STEP_GENERATOR)
+        teacher_trajectory = state.extra.get(_STEP_TEACHER_TRAJECTORY)
+        if teacher_trajectory is not None:
+            teacher_trajectory["predictions"].append(noise_pred[0].detach().float().clone())
+            teacher_trajectory["timesteps"].append(state.current_timestep.detach().float().clone())
+            teacher_trajectory["timesteps_r"].append(
+                _get_meanflow_timestep_r(state.scheduler, state.current_timestep).detach().float().clone()
+            )
         step_kwargs = self.pipeline.prepare_extra_func_kwargs(state.scheduler.step, {"generator": generator})
         latent_dtype = state.latents.dtype
         state.latents = state.scheduler.step(
@@ -2371,6 +2432,8 @@ class HunyuanImage3Pipeline(
             **step_kwargs,
             return_dict=False,
         )[0].to(dtype=latent_dtype)
+        if teacher_trajectory is not None:
+            teacher_trajectory["latents"].append(state.latents[0].detach().float().clone())
         state.step_index += 1
 
     def post_decode(
@@ -2379,6 +2442,24 @@ class HunyuanImage3Pipeline(
         **kwargs: Any,
     ) -> DiffusionOutput:
         output_type = kwargs.get("output_type", "pil")
+        teacher_trajectory = state.extra.get(_STEP_TEACHER_TRAJECTORY)
+        if teacher_trajectory is not None:
+            step_count = len(teacher_trajectory["predictions"])
+            if len(teacher_trajectory["latents"]) != step_count + 1:
+                raise RuntimeError("Teacher trajectory must contain one more latent than prediction.")
+            trajectory_payload = {
+                "latents": torch.stack(teacher_trajectory["latents"]),
+                "predictions": torch.stack(teacher_trajectory["predictions"]),
+                "timesteps": torch.stack(teacher_trajectory["timesteps"]).reshape(-1),
+                "timesteps_r": torch.stack(teacher_trajectory["timesteps_r"]).reshape(-1),
+                "condition": teacher_trajectory["condition"],
+                "metadata": teacher_trajectory["metadata"],
+            }
+            return DiffusionOutput(
+                output={"payload": {"trajectory": trajectory_payload}},
+                stage_durations=getattr(self, "stage_durations", None),
+                to_cpu=True,
+            )
         generator = state.extra.get(_STEP_GENERATOR)
         latents = state.latents
         if output_type == "latent":

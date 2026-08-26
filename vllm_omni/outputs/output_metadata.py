@@ -50,6 +50,10 @@ class DiffusionTrajectoryPayload(TypedDict, total=False):
     timesteps: torch.Tensor | dict[str, Any] | None
     log_probs: torch.Tensor | dict[str, Any] | None
     decoded: list[PIL.Image.Image] | None
+    predictions: torch.Tensor | dict[str, Any] | None
+    timesteps_r: torch.Tensor | dict[str, Any] | None
+    condition: dict[str, Any] | None
+    metadata: dict[str, Any] | None
 
 
 # Concrete payload values produced by post_process.

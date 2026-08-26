@@ -299,6 +299,9 @@ class OmniDiffusionSamplingParams:
     modules: dict[str, Any] = field(default_factory=dict)
 
     return_trajectory_latents: bool = False
+    # Return the full Dense teacher trajectory used for SLA recovery. Model
+    # pipelines opt in explicitly; unsupported pipelines ignore this flag.
+    return_teacher_trajectory: bool = False
     return_trajectory_decoded: bool = False
     trajectory_timesteps: list[torch.Tensor] | None = None
     trajectory_latents: torch.Tensor | None = None
