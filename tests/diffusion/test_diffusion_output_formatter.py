@@ -164,6 +164,7 @@ def test_formatter_maps_trajectory_payload_to_request_output(
     log_probs = torch.tensor([-0.1, -0.2])
     predictions = torch.ones(2, 1, 4)
     timesteps_r = torch.tensor([0.5, 0.0])
+    scheduler_dts = torch.tensor([-0.5, -0.5])
     condition = {"input_ids": torch.ones(1, 3, dtype=torch.long)}
     postprocess_output = normalize_diffusion_postprocess_output(
         {
@@ -175,6 +176,7 @@ def test_formatter_maps_trajectory_payload_to_request_output(
                     "log_probs": log_probs,
                     "predictions": predictions,
                     "timesteps_r": timesteps_r,
+                    "scheduler_dts": scheduler_dts,
                     "condition": condition,
                 },
             },
@@ -203,6 +205,7 @@ def test_formatter_maps_trajectory_payload_to_request_output(
             "log_probs": log_probs,
             "predictions": predictions,
             "timesteps_r": timesteps_r,
+            "scheduler_dts": scheduler_dts,
             "condition": condition,
         },
     }

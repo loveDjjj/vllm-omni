@@ -173,6 +173,13 @@ def _get_meanflow_timestep_r(scheduler, timestep: torch.Tensor) -> torch.Tensor:
     return scheduler.sigmas[scheduler.step_index + 1] * scheduler.config.num_train_timesteps
 
 
+def _get_scheduler_dt(scheduler, timestep: torch.Tensor) -> torch.Tensor:
+    """Return the exact sigma delta consumed by the next Euler step."""
+    if scheduler.step_index is None:
+        scheduler._init_step_index(timestep)
+    return scheduler.sigmas[scheduler.step_index + 1] - scheduler.sigmas[scheduler.step_index]
+
+
 def real_batched_index_select(t, dim, idx):
     """index_select for batched index and batched t"""
     assert t.ndim >= 2 and idx.ndim >= 2, f"{t.ndim=} {idx.ndim=}"
@@ -3157,6 +3164,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                 "predictions": [],
                 "timesteps": [],
                 "timesteps_r": [],
+                "scheduler_dts": [],
                 "condition": {
                     "input_ids": input_ids.detach().clone(),
                     "position_ids": clone_condition("position_ids"),
@@ -3272,6 +3280,9 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     teacher_trajectory["predictions"].append(pred[0].detach().float().clone())
                     teacher_trajectory["timesteps"].append(t.detach().float().clone())
                     teacher_trajectory["timesteps_r"].append(timestep_r.detach().float().clone())
+                    teacher_trajectory["scheduler_dts"].append(
+                        _get_scheduler_dt(self.scheduler, t).detach().float().clone()
+                    )
 
                 # Scheduler step (all ranks compute locally in CFG parallel)
                 latents = self.scheduler.step(pred, t, latents, **_scheduler_step_extra_kwargs, return_dict=False)[0]
@@ -3314,6 +3325,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     "predictions": torch.stack(teacher_trajectory["predictions"]),
                     "timesteps": torch.stack(teacher_trajectory["timesteps"]).reshape(-1),
                     "timesteps_r": torch.stack(teacher_trajectory["timesteps_r"]).reshape(-1),
+                    "scheduler_dts": torch.stack(teacher_trajectory["scheduler_dts"]).reshape(-1),
                     "condition": teacher_trajectory["condition"],
                     "metadata": teacher_trajectory["metadata"],
                 },

@@ -359,6 +359,7 @@ def _trajectory_payload(
             ("decoded", "decoded"),
             ("predictions", "predictions"),
             ("timesteps_r", "timesteps_r"),
+            ("scheduler_dts", "scheduler_dts"),
             ("condition", "condition"),
             ("metadata", "metadata"),
         ):

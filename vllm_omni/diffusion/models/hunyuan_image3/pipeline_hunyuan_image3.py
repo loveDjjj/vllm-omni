@@ -83,6 +83,12 @@ def _get_meanflow_timestep_r(scheduler, timestep: torch.Tensor) -> torch.Tensor:
     return scheduler.sigmas[scheduler.step_index + 1] * scheduler.config.num_train_timesteps
 
 
+def _get_scheduler_dt(scheduler, timestep: torch.Tensor) -> torch.Tensor:
+    if scheduler.step_index is None:
+        scheduler._init_step_index(timestep)
+    return scheduler.sigmas[scheduler.step_index + 1] - scheduler.sigmas[scheduler.step_index]
+
+
 def default(val, d):
     return val if val is not None else d
 
@@ -2123,6 +2129,7 @@ class HunyuanImage3Pipeline(
                 "predictions": [],
                 "timesteps": [],
                 "timesteps_r": [],
+                "scheduler_dts": [],
                 "condition": {
                     "input_ids": input_ids.detach().clone(),
                     "position_ids": clone_tensor("position_ids"),
@@ -2426,6 +2433,9 @@ class HunyuanImage3Pipeline(
             teacher_trajectory["timesteps_r"].append(
                 _get_meanflow_timestep_r(state.scheduler, state.current_timestep).detach().float().clone()
             )
+            teacher_trajectory["scheduler_dts"].append(
+                _get_scheduler_dt(state.scheduler, state.current_timestep).detach().float().clone()
+            )
         step_kwargs = self.pipeline.prepare_extra_func_kwargs(state.scheduler.step, {"generator": generator})
         latent_dtype = state.latents.dtype
         state.latents = state.scheduler.step(
@@ -2455,6 +2465,7 @@ class HunyuanImage3Pipeline(
                 "predictions": torch.stack(teacher_trajectory["predictions"]),
                 "timesteps": torch.stack(teacher_trajectory["timesteps"]).reshape(-1),
                 "timesteps_r": torch.stack(teacher_trajectory["timesteps_r"]).reshape(-1),
+                "scheduler_dts": torch.stack(teacher_trajectory["scheduler_dts"]).reshape(-1),
                 "condition": teacher_trajectory["condition"],
                 "metadata": teacher_trajectory["metadata"],
             }

@@ -252,6 +252,10 @@ def test_step_scheduler_records_dense_teacher_trajectory():
     pipeline._pipeline = SimpleNamespace(prepare_extra_func_kwargs=lambda step, kwargs: {})
 
     class FakeScheduler:
+        def __init__(self):
+            self.step_index = 0
+            self.sigmas = torch.tensor([1.0, 0.75])
+
         def get_timestep_r(self, timestep):
             return timestep - 0.25
 
@@ -269,6 +273,7 @@ def test_step_scheduler_records_dense_teacher_trajectory():
         "predictions": [],
         "timesteps": [],
         "timesteps_r": [],
+        "scheduler_dts": [],
         "condition": {"input_ids": torch.ones(1, 3, dtype=torch.long)},
         "metadata": {"prompt": "test"},
     }
@@ -282,6 +287,7 @@ def test_step_scheduler_records_dense_teacher_trajectory():
     assert trajectory["predictions"].shape == (1, 4, 8, 8)
     torch.testing.assert_close(trajectory["timesteps"], torch.tensor([1.0]))
     torch.testing.assert_close(trajectory["timesteps_r"], torch.tensor([0.75]))
+    torch.testing.assert_close(trajectory["scheduler_dts"], torch.tensor([-0.25]))
     assert result.to_cpu is True
 
 

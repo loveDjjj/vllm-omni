@@ -52,6 +52,7 @@ class DiffusionTrajectoryPayload(TypedDict, total=False):
     decoded: list[PIL.Image.Image] | None
     predictions: torch.Tensor | dict[str, Any] | None
     timesteps_r: torch.Tensor | dict[str, Any] | None
+    scheduler_dts: torch.Tensor | dict[str, Any] | None
     condition: dict[str, Any] | None
     metadata: dict[str, Any] | None
 
