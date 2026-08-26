@@ -8,6 +8,7 @@ import torch
 
 import vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 as hy3_module
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import ImageInfo
 from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
     _STEP_AR_KV,
     _STEP_CFG_FACTOR,
@@ -76,6 +77,19 @@ def _sampling_params(**extra_args):
         guidance_rescale=0.0,
         generator=None,
     )
+
+
+def test_meanflow_image_info_exports_timestep_r_layout_flag():
+    image_info = ImageInfo(
+        image_type="gen_image",
+        token_width=8,
+        token_height=8,
+        add_timestep_token=True,
+        add_guidance_token=True,
+        add_timestep_r_token=True,
+    )
+
+    assert image_info.meta_info["add_timestep_r_token"] is True
 
 
 def test_hunyuan_step_group_key_ignores_step_index_for_later_steps():
