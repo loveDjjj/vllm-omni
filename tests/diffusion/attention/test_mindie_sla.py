@@ -298,6 +298,40 @@ def test_hybrid_query_prefix_excludes_three_dynamic_special_tokens(fake_mindiesd
     assert output.shape == query.shape
 
 
+def test_hybrid_static_prefix_may_contain_earlier_image_spans(fake_mindiesd, tmp_path):
+    _load_adapter.cache_clear()
+    impl = _make_impl(_make_adapter(tmp_path))
+    first_query = torch.randn(1, 10, 4, 64)
+    key = torch.randn(1, 10, 1, 64)
+    value = torch.randn_like(key)
+    spans = [[(1, 3), (8, 10)]]
+    impl._hybrid_masked_forward(
+        first_query,
+        key,
+        value,
+        AttentionMetadata(
+            attn_mask=torch.ones(1, 1, 10, 10, dtype=torch.bool),
+            full_attn_spans=spans,
+            extra={"sla_static_prefix_lens": [5]},
+        ),
+    )
+
+    query = torch.randn(1, 5, 4, 64)
+    output = impl._hybrid_masked_forward(
+        query,
+        key,
+        value,
+        AttentionMetadata(
+            attn_mask=torch.ones(1, 1, 5, 10, dtype=torch.bool),
+            full_attn_spans=spans,
+            extra={"sla_static_prefix_lens": [5]},
+        ),
+    )
+
+    assert impl._query_prefix_cache[0].shape[1] == 5
+    assert output.shape == query.shape
+
+
 def test_module_forward_dispatches_to_npu_implementation(fake_mindiesd, tmp_path):
     _load_adapter.cache_clear()
     impl = _make_impl(_make_adapter(tmp_path))

@@ -409,10 +409,10 @@ class MindIESLAImpl(nn.Module, AttentionImpl):
                     if static_prefix_lens is not None
                     else image_start
                 )
-                if prefix_len < 0 or prefix_len > image_start:
+                if prefix_len < 0 or prefix_len > query_len:
                     raise ValueError(
-                        "MINDIE_SLA static prefix must end before the first full-attention image span: "
-                        f"batch={index}, prefix_len={prefix_len}, image_start={image_start}."
+                        "MINDIE_SLA static prefix length is outside the first-step query: "
+                        f"batch={index}, prefix_len={prefix_len}, query_len={query_len}."
                     )
                 self._query_prefix_cache.append(query[index:index + 1, :prefix_len].detach())
         elif self._query_prefix_cache is None or len(self._query_prefix_cache) != query.shape[0]:
