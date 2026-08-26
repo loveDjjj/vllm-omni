@@ -8,7 +8,10 @@ import torch
 
 import vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 as hy3_module
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
-from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import ImageInfo
+from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
+    ImageInfo,
+    _get_meanflow_timestep_r,
+)
 from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
     _STEP_AR_KV,
     _STEP_CFG_FACTOR,
@@ -90,6 +93,13 @@ def test_meanflow_image_info_exports_timestep_r_layout_flag():
     )
 
     assert image_info.meta_info["add_timestep_r_token"] is True
+
+
+def test_legacy_meanflow_loop_uses_scheduler_timestep_r():
+    scheduler = SimpleNamespace(get_timestep_r=lambda timestep: timestep - 0.25)
+    timestep = torch.tensor(1.0)
+
+    torch.testing.assert_close(_get_meanflow_timestep_r(scheduler, timestep), torch.tensor(0.75))
 
 
 def test_hunyuan_step_group_key_ignores_step_index_for_later_steps():

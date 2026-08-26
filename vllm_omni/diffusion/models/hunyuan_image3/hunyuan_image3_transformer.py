@@ -164,6 +164,15 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
+def _get_meanflow_timestep_r(scheduler, timestep: torch.Tensor) -> torch.Tensor:
+    """Return the next MeanFlow timestep without inventing a request default."""
+    if hasattr(scheduler, "get_timestep_r"):
+        return scheduler.get_timestep_r(timestep)
+    if scheduler.step_index is None:
+        scheduler._init_step_index(timestep)
+    return scheduler.sigmas[scheduler.step_index + 1] * scheduler.config.num_train_timesteps
+
+
 def real_batched_index_select(t, dim, idx):
     """index_select for batched index and batched t"""
     assert t.ndim >= 2 and idx.ndim >= 2, f"{t.ndim=} {idx.ndim=}"
@@ -3060,6 +3069,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         self._guidance_scale = guidance_scale
         self._guidance_rescale = guidance_rescale
         cfg_distilled = self.model.cfg_distilled
+        use_meanflow = bool(getattr(self.model.config, "use_meanflow", False))
         do_true_cfg = self.do_classifier_free_guidance and not cfg_distilled
 
         # Detect CFG parallel configuration (only 2-branch layout is supported)
@@ -3125,6 +3135,8 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         model_kwargs["query_lens"] = query_lens
         model_kwargs["seq_lens"] = seq_lens
         model_kwargs["attention_mask"] = attention_mask.to(latents.device)
+        if use_meanflow and model_kwargs.get("timesteps_r_scatter_index") is None:
+            raise ValueError("MeanFlow Hunyuan layout is missing timesteps_r_scatter_index before denoising.")
 
         # Attempt to reuse KV cache from the AR stage.
         # Note: the reusable KV length may differ between positive and negative prompts.
@@ -3165,6 +3177,11 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                         1000.0 * self._guidance_scale,
                         device=device,
                         dtype=torch.bfloat16,
+                    )
+                if use_meanflow:
+                    timestep_r = _get_meanflow_timestep_r(self.scheduler, t)
+                    model_kwargs["timestep_r"] = timestep_r.repeat(latent_model_input.shape[0]).to(
+                        device=device, dtype=torch.float32
                     )
 
                 # ---- TeaCache: decide whether to compute or reuse ----
