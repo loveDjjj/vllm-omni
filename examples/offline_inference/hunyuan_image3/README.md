@@ -13,6 +13,7 @@ YAMLs under `vllm_omni/deploy/`.
 | `vllm_omni/deploy/hunyuan_image_3_distil_ar_capture.yaml` | Distil AR TP8 | Offline SLA condition capture. |
 | `vllm_omni/deploy/hunyuan_image_3_distil_dit_trajectory.yaml` | Dense Distil DiT TP8+EP | Offline SLA teacher trajectory capture. |
 | `vllm_omni/deploy/hunyuan_image_3_distil_trajectory_16npu.yaml` | Distil AR TP8 + Dense DiT TP8+EP | End-to-end 16-NPU trajectory capture. |
+| `vllm_omni/deploy/hunyuan_image_3_distil_sla_zero.yaml` | Distil AR TP8 + ZeroInit SLA DiT TP8+EP | Untrained sparse-attention quality baseline. |
 
 The trajectory deploys are consumed by the companion HunyuanImage3-SLA
 offline collector. They force the Dense `TORCH_SDPA` teacher, 8-step MeanFlow,

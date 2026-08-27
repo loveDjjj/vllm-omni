@@ -1,0 +1,77 @@
+# HunyuanImage-3.0-Instruct-Distil ZeroInit SLA baseline on 16 Ascend NPUs.
+# The adapter must contain zero proj_l weights only. Base QKV/O remain unchanged.
+pipeline: hunyuan_image_3_moe
+async_chunk: false
+trust_remote_code: true
+
+connectors:
+  shared_memory_connector:
+    name: SharedMemoryConnector
+
+stages:
+  - stage_id: 0
+    is_comprehension: true
+    final_output: true
+    final_output_type: text
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.8
+    enforce_eager: true
+    max_num_batched_tokens: 8192
+    devices: "0,1,2,3,4,5,6,7"
+    tensor_parallel_size: 8
+    hf_overrides:
+      rope_parameters:
+        mrope_section: [0, 32, 32]
+        rope_type: default
+    output_connectors:
+      to_stage_1: shared_memory_connector
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1
+      top_k: -1
+      max_tokens: 8192
+      detokenize: true
+      skip_special_tokens: false
+      include_stop_str_in_output: true
+
+  - stage_id: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.65
+    enforce_eager: true
+    devices: "8,9,10,11,12,13,14,15"
+    distributed_executor_backend: "mp"
+    diffusion_attention_config:
+      default:
+        backend: TORCH_SDPA
+      per_role:
+        hunyuan.ar:
+          backend: TORCH_SDPA
+        hunyuan.diffusion:
+          backend: MINDIE_SLA
+          mindie_sla:
+            adapter_path: ${oc.env:HUNYUAN_SLA_ADAPTER}
+            topk: 0.125
+            blkq: 128
+            blkk: 128
+            use_bf16: true
+            mask_policy: hybrid
+    parallel_config:
+      tensor_parallel_size: 8
+      enable_expert_parallel: true
+      sequence_parallel_size: 1
+      ulysses_degree: 1
+      ring_degree: 1
+      allgather_degree: 1
+      cfg_parallel_size: 1
+    input_connectors:
+      from_stage_0: shared_memory_connector
+    default_sampling_params:
+      num_inference_steps: 8
+      guidance_scale: 2.5
+      seed: 42
+
+edges:
+  - from: 0
+    to: 1
+    window_size: -1
+    max_inflight: 1
