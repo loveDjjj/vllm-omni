@@ -104,6 +104,48 @@ def _make_v2_adapter(tmp_path):
     return tmp_path, tensors
 
 
+def _make_v3_adapter(tmp_path):
+    tensors = {}
+    for layer in range(2):
+        tensors[f"layers.{layer}.sla.proj_l.weight"] = torch.zeros(2, 2)
+        tensors[f"layers.{layer}.sla.proj_l.bias"] = torch.zeros(2)
+        tensors[f"layers.{layer}.qkv_lora.a.weight"] = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        tensors[f"layers.{layer}.qkv_lora.b.weight"] = torch.ones(8, 2)
+        tensors[f"layers.{layer}.o_lora.a.weight"] = torch.ones(2, 4)
+        tensors[f"layers.{layer}.o_lora.b.weight"] = torch.full((4, 2), 2.0)
+        for expert in range(2):
+            prefix = f"layers.{layer}.moe.experts.{expert}.down_lora"
+            tensors[f"{prefix}.a.weight"] = torch.ones(1, 3)
+            tensors[f"{prefix}.b.weight"] = torch.full((4, 1), float(expert + 1))
+    weights = tmp_path / "adapter.safetensors"
+    save_file(tensors, str(weights))
+    config = {
+        "format_version": 3,
+        "architecture": "HunyuanImage3SparseLinearAttentionAdapter",
+        "num_layers": 2,
+        "head_dim": 2,
+        "hidden_size": 4,
+        "q_heads": 2,
+        "kv_heads": 1,
+        "num_experts": 2,
+        "moe_intermediate_size": 3,
+        "attention_lora_rank": 2,
+        "attention_lora_alpha": 2,
+        "moe_down_lora_rank": 1,
+        "moe_down_lora_alpha": 1,
+        "trained_components": ["proj_l", "qkv_lora", "o_lora", "moe_down_lora"],
+        "topk": 0.125,
+        "blkq": 64,
+        "blkk": 128,
+        "compute_dtype": "bfloat16",
+        "tensor_count": len(tensors),
+        "parameter_count": sum(t.numel() for t in tensors.values()),
+        "adapter_sha256": hashlib.sha256(weights.read_bytes()).hexdigest(),
+    }
+    (tmp_path / "adapter_config.json").write_text(json.dumps(config), encoding="utf-8")
+    return tmp_path, tensors
+
+
 def _make_impl(adapter_path):
     return MindIESLAImpl(
         num_heads=4,
@@ -231,6 +273,36 @@ def test_v2_packed_qkv_delta_supports_split_checkpoints(tmp_path):
     }
     for projection, tensor in expected.items():
         torch.testing.assert_close(loaded[f"model.layers.0.self_attn.{projection}.weight"], tensor)
+
+
+def test_v3_attention_and_moe_lora_are_merged_before_parallel_loading(tmp_path):
+    _load_adapter.cache_clear()
+    adapter, tensors = _make_v3_adapter(tmp_path)
+    base_weights = [
+        ("model.layers.0.self_attn.qkv_proj.weight", torch.zeros(8, 4)),
+        ("model.layers.0.self_attn.o_proj.weight", torch.ones(4, 4)),
+        ("model.layers.0.mlp.experts.0.down_proj.weight", torch.zeros(4, 3)),
+        ("model.layers.0.mlp.experts.1.down_proj.weight", torch.ones(4, 3)),
+        ("model.layers.0.mlp.shared_mlp.down_proj.weight", torch.full((4, 3), 7.0)),
+    ]
+
+    loaded = dict(apply_attention_deltas(iter(base_weights), str(adapter)))
+
+    qkv = tensors["layers.0.qkv_lora.b.weight"] @ tensors["layers.0.qkv_lora.a.weight"]
+    output = tensors["layers.0.o_lora.b.weight"] @ tensors["layers.0.o_lora.a.weight"]
+    expert0 = (
+        tensors["layers.0.moe.experts.0.down_lora.b.weight"]
+        @ tensors["layers.0.moe.experts.0.down_lora.a.weight"]
+    )
+    expert1 = (
+        tensors["layers.0.moe.experts.1.down_lora.b.weight"]
+        @ tensors["layers.0.moe.experts.1.down_lora.a.weight"]
+    )
+    torch.testing.assert_close(loaded[base_weights[0][0]], qkv)
+    torch.testing.assert_close(loaded[base_weights[1][0]], torch.ones(4, 4) + output)
+    torch.testing.assert_close(loaded[base_weights[2][0]], expert0)
+    torch.testing.assert_close(loaded[base_weights[3][0]], torch.ones(4, 3) + expert1)
+    torch.testing.assert_close(loaded[base_weights[4][0]], torch.full((4, 3), 7.0))
 
 
 def test_gqa_repeat_is_idempotent_after_hunyuan_repeat():

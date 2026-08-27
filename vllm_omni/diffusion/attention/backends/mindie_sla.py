@@ -29,12 +29,15 @@ from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import build_se
 
 logger = init_logger(__name__)
 
-_SUPPORTED_FORMAT_VERSIONS = frozenset({1, 2})
+_SUPPORTED_FORMAT_VERSIONS = frozenset({1, 2, 3})
 _ARCHITECTURE = "HunyuanImage3SparseLinearAttentionAdapter"
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 _ATTENTION_WEIGHT_RE = re.compile(
     r"^model\.layers\.(\d+)\.(?:module\.)?self_attn\."
     r"(qkv_proj|q_proj|k_proj|v_proj|o_proj)\.weight$"
+)
+_MOE_DOWN_WEIGHT_RE = re.compile(
+    r"^model\.layers\.(\d+)\.(?:module\.)?mlp\.experts\.(\d+)\.down_proj\.weight$"
 )
 _VALID_MASK_POLICIES = frozenset({"hybrid", "error", "dense_fallback"})
 
@@ -92,7 +95,9 @@ def _load_adapter(adapter_path: str) -> tuple[dict[str, Any], dict[str, torch.Te
     components = tuple(config.get("trained_components", ("proj_l",)))
     if not components or components[0] != "proj_l":
         raise ValueError(f"SLA adapter must include proj_l; got trained_components={components}.")
-    valid_components = {"proj_l", "qkv_delta", "o_delta"}
+    valid_components = {
+        "proj_l", "qkv_delta", "o_delta", "qkv_lora", "o_lora", "moe_down_lora"
+    }
     if set(components) - valid_components:
         raise ValueError(f"Unsupported SLA adapter trained_components={components}.")
     expected_keys = {
@@ -102,15 +107,42 @@ def _load_adapter(adapter_path: str) -> tuple[dict[str, Any], dict[str, torch.Te
         expected_keys.update(f"layers.{layer}.qkv_delta.weight" for layer in range(num_layers))
     if "o_delta" in components:
         expected_keys.update(f"layers.{layer}.o_delta.weight" for layer in range(num_layers))
+    if "qkv_lora" in components:
+        expected_keys.update(
+            f"layers.{layer}.qkv_lora.{factor}.weight"
+            for layer in range(num_layers)
+            for factor in ("a", "b")
+        )
+    if "o_lora" in components:
+        expected_keys.update(
+            f"layers.{layer}.o_lora.{factor}.weight"
+            for layer in range(num_layers)
+            for factor in ("a", "b")
+        )
+    num_experts = int(config.get("num_experts", 64))
+    if "moe_down_lora" in components:
+        expected_keys.update(
+            f"layers.{layer}.moe.experts.{expert}.down_lora.{factor}.weight"
+            for layer in range(num_layers)
+            for expert in range(num_experts)
+            for factor in ("a", "b")
+        )
     hidden_size = int(config.get("hidden_size", 4096))
     q_heads = int(config.get("q_heads", 32))
     kv_heads = int(config.get("kv_heads", 8))
     qkv_size = head_dim * (q_heads + 2 * kv_heads)
+    attention_rank = int(config.get("attention_lora_rank", 0))
+    moe_rank = int(config.get("moe_down_lora_rank", 0))
+    moe_intermediate_size = int(config.get("moe_intermediate_size", 3072))
     expected_shapes = {
         "sla.proj_l.weight": (head_dim, head_dim),
         "sla.proj_l.bias": (head_dim,),
         "qkv_delta.weight": (qkv_size, hidden_size),
         "o_delta.weight": (hidden_size, q_heads * head_dim),
+        "qkv_lora.a.weight": (attention_rank, hidden_size),
+        "qkv_lora.b.weight": (qkv_size, attention_rank),
+        "o_lora.a.weight": (attention_rank, q_heads * head_dim),
+        "o_lora.b.weight": (hidden_size, attention_rank),
     }
     proj_tensors: dict[str, torch.Tensor] = {}
     parameter_count = 0
@@ -125,7 +157,15 @@ def _load_adapter(adapter_path: str) -> tuple[dict[str, Any], dict[str, torch.Te
         for name in sorted(actual_keys):
             suffix = name.split(f"layers.{_layer_index(name)}.", 1)[1]
             shape = tuple(handle.get_slice(name).get_shape())
-            expected_shape = expected_shapes[suffix]
+            if suffix.startswith("moe.experts."):
+                factor = suffix.rsplit(".", 2)[-2]
+                expected_shape = (
+                    (moe_rank, moe_intermediate_size)
+                    if factor == "a"
+                    else (hidden_size, moe_rank)
+                )
+            else:
+                expected_shape = expected_shapes[suffix]
             if shape != expected_shape:
                 raise ValueError(
                     f"Invalid SLA tensor shape for {name}: expected {expected_shape}, got {shape}"
@@ -171,26 +211,50 @@ def apply_attention_deltas(
     weights: Iterable[tuple[str, torch.Tensor]],
     adapter_path: str,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Add full-rank QKV/O deltas before vLLM performs tensor-parallel sharding."""
+    """Merge attention and expert deltas before vLLM performs TP/EP sharding."""
     config, _ = _load_adapter(adapter_path)
     components = set(config.get("trained_components", ("proj_l",)))
-    if not components.intersection({"qkv_delta", "o_delta"}):
+    if not components.intersection(
+        {"qkv_delta", "o_delta", "qkv_lora", "o_lora", "moe_down_lora"}
+    ):
         yield from weights
         return
     weights_path, _ = _resolve_adapter_paths(adapter_path)
     with safe_open(str(weights_path), framework="pt", device="cpu") as handle:
         for name, tensor in weights:
             match = _ATTENTION_WEIGHT_RE.search(name)
-            if match is None:
-                yield name, tensor
-                continue
-            layer, projection = int(match.group(1)), match.group(2)
             delta = None
-            if projection == "o_proj" and "o_delta" in components:
-                delta = handle.get_tensor(f"layers.{layer}.o_delta.weight")
-            elif projection in {"qkv_proj", "q_proj", "k_proj", "v_proj"} and "qkv_delta" in components:
-                packed = handle.get_tensor(f"layers.{layer}.qkv_delta.weight")
-                delta = packed if projection == "qkv_proj" else _split_interleaved_qkv(packed, config)[projection]
+            if match is not None:
+                layer, projection = int(match.group(1)), match.group(2)
+                if projection == "o_proj":
+                    if "o_delta" in components:
+                        delta = handle.get_tensor(f"layers.{layer}.o_delta.weight")
+                    elif "o_lora" in components:
+                        delta = _materialize_lora(handle, f"layers.{layer}.o_lora", config, "attention")
+                elif projection in {"qkv_proj", "q_proj", "k_proj", "v_proj"}:
+                    packed = None
+                    if "qkv_delta" in components:
+                        packed = handle.get_tensor(f"layers.{layer}.qkv_delta.weight")
+                    elif "qkv_lora" in components:
+                        packed = _materialize_lora(
+                            handle, f"layers.{layer}.qkv_lora", config, "attention"
+                        )
+                    if packed is not None:
+                        delta = (
+                            packed
+                            if projection == "qkv_proj"
+                            else _split_interleaved_qkv(packed, config)[projection]
+                        )
+            else:
+                moe_match = _MOE_DOWN_WEIGHT_RE.search(name)
+                if moe_match is not None and "moe_down_lora" in components:
+                    layer, expert = int(moe_match.group(1)), int(moe_match.group(2))
+                    delta = _materialize_lora(
+                        handle,
+                        f"layers.{layer}.moe.experts.{expert}.down_lora",
+                        config,
+                        "moe",
+                    )
             if delta is not None:
                 if tuple(delta.shape) != tuple(tensor.shape):
                     raise ValueError(
@@ -198,6 +262,24 @@ def apply_attention_deltas(
                     )
                 tensor = tensor + delta.to(device=tensor.device, dtype=tensor.dtype)
             yield name, tensor
+
+
+def _materialize_lora(handle, prefix: str, config: dict[str, Any], kind: str) -> torch.Tensor:
+    a = handle.get_tensor(f"{prefix}.a.weight").float()
+    b = handle.get_tensor(f"{prefix}.b.weight").float()
+    if not torch.isfinite(a).all().item() or not torch.isfinite(b).all().item():
+        raise ValueError(f"LoRA tensor contains NaN or Inf: {prefix}.")
+    if kind == "attention":
+        rank = int(config["attention_lora_rank"])
+        alpha = float(config["attention_lora_alpha"])
+    elif kind == "moe":
+        rank = int(config["moe_down_lora_rank"])
+        alpha = float(config["moe_down_lora_alpha"])
+    else:
+        raise ValueError(f"Unknown LoRA kind: {kind}")
+    if rank <= 0 or a.shape[0] != rank or b.shape[1] != rank:
+        raise ValueError(f"Invalid {kind} LoRA rank for {prefix}: config={rank}, A={a.shape}, B={b.shape}.")
+    return torch.matmul(b, a).mul_(alpha / rank)
 
 
 def _layer_index(prefix: str) -> int:
